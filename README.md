@@ -90,6 +90,52 @@ import itasca_mcp_bridge
 itasca_mcp_bridge.start()
 ```
 
+### Start with the product
+
+Typing those two lines is fine once. It is also why a bridge is only up when
+somebody remembers to start it, which is the wrong default for a server whose
+whole point is that a client can connect to it. `autostart` writes a
+`sitecustomize.py` into the product's embedded Python, and CPython imports
+that name at every interpreter startup:
+
+```console
+$ python -m itasca_mcp_bridge autostart install
+$ python -m itasca_mcp_bridge autostart status
+$ python -m itasca_mcp_bridge autostart remove
+```
+
+`install` searches the usual ITASCA install roots (`--root` to point it
+somewhere else, repeatable). Start the product; within a few seconds
+`http://localhost:9001/health` answers with `"runtime_mode": "gui"`. The hook
+logs what it did to `%TEMP%\itasca_mcp_bridge_autostart.log`, and starts
+nothing on a machine where a bridge is already listening.
+
+It is written to be safe inside someone's GUI. Only an ITASCA product binary
+arms it (`pfc2d700_gui.exe`, not the `exe64/python36/python.exe` the
+self-upgrade runs pip with). Readiness is polled on a daemon thread and
+`start()` is queued onto the **GUI thread**, because a Qt timer installed
+from any other thread never ticks — `/health` answers 200 while every
+submitted task hangs. Console builds are left alone. A `sitecustomize.py`
+that is not ours is backed up rather than replaced.
+
+The product raises a per-revision notice window listing what changed. It is
+left alone by default: a bridge that closes windows it did not cause is
+making a call that belongs to the person at the keyboard.
+
+| Variable | Default | |
+| :--- | :--- | :--- |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_PORT` | `9001` | port to serve on |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_HOST` | `localhost` | interface to bind |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_TIMEOUT` | `120` | seconds to wait for the engine and Qt |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_CLOSE_NOTICE` | off | set to `1` to close the revision notice (unattended starts) |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_LOG` | `%TEMP%\...` | where to log; empty string logs nowhere |
+| `ITASCA_MCP_BRIDGE_ROOTS` | — | `;`-separated roots for `install` |
+
+> `exe64/addon.py` looks like the extension point and is not: nothing reads
+> it. Measured with a marker-file probe, the marker never appears even with
+> the GUI fully initialised, and `addon.py` occurs zero times in the product
+> executables. `sitecustomize.py` really is imported.
+
 ### Headless, agent-launched
 
 A console build runs the data file passed as its first argument, so an

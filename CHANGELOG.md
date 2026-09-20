@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `itasca_mcp_bridge.autostart` and `python -m itasca_mcp_bridge autostart
+  install|remove|status`, which start the bridge whenever an ITASCA product
+  starts. `install` writes a `sitecustomize.py` shim into the product's
+  embedded Python; CPython imports that name at every interpreter startup,
+  so the product brings the bridge up on its own and nobody has to type
+  anything into the IPython console. It is gated on the interpreter basename
+  (the self-upgrade's `exe64/python36/python.exe` is skipped rather than
+  polling for two minutes), waits for the engine bindings and a GUI Qt
+  application on a daemon thread, and queues `start()` onto the **GUI
+  thread** -- a `QTimer` installed from any other thread never ticks, which
+  looks like success: `/health` answers 200 while every submitted task
+  hangs. Console builds are left alone, an existing `sitecustomize.py` that
+  is not ours is backed up rather than replaced, and nothing is started when
+  a bridge is already listening on the port. Closing the product's
+  per-revision notice window is available but off by default.
+
+  (`exe64/addon.py`, which looks like the intended extension point, is not:
+  a marker-file probe never fires, GUI fully initialised, and the name occurs
+  zero times in the product executables.)
+
+### Fixed
+- `itasca_mcp_bridge/__main__.py` ended with a bare `main()` at module level
+  instead of under an `if __name__ == "__main__"` guard, so importing the
+  module started the bridge. The console script's entry point is
+  `itasca_mcp_bridge.__main__:main`, and importing a module to reach its
+  `main` runs its body: `itasca-mcp-bridge` therefore began serving during
+  the import, before the generated wrapper reached its own call — and since
+  `start()` blocks, that second call was the one that never happened.
+
 ## [0.5.5] - 2026-09-15
 
 ### Fixed

@@ -81,6 +81,48 @@ import itasca_mcp_bridge
 itasca_mcp_bridge.start()
 ```
 
+### 随产品一起启动
+
+手敲那两行，敲一次没问题。问题在于这也意味着：只有有人记得启动时 bridge 才在跑，
+而这是一个"客户端本来就该连得上"的服务端，这个默认值是错的。`autostart` 会往
+产品的内嵌 Python 里写一个 `sitecustomize.py`，而 CPython 在每次解释器启动时
+都会自动导入这个名字：
+
+```console
+$ python -m itasca_mcp_bridge autostart install
+$ python -m itasca_mcp_bridge autostart status
+$ python -m itasca_mcp_bridge autostart remove
+```
+
+`install` 会搜索常见的 ITASCA 安装根目录（`--root` 可指定别处，可重复）。
+启动产品，几秒后 `http://localhost:9001/health` 就会以
+`"runtime_mode": "gui"` 应答。钩子把做过的事记到
+`%TEMP%\itasca_mcp_bridge_autostart.log`；如果机器上已经有 bridge 在监听，
+它什么都不做。
+
+它是按"跑在别人的 GUI 里"来写的。只有 ITASCA 产品自己的可执行文件才会激活它
+（`pfc2d700_gui.exe` 会，自升级用来跑 pip 的 `exe64/python36/python.exe` 不会）。
+就绪状态由一个守护线程轮询，`start()` 被**排队到 GUI 线程**上执行——从别的
+线程装上去的 Qt 定时器永远不会 tick，那种情况下 `/health` 回 200，而每一个
+提交的任务都吊死。控制台构建不碰。不是我们写的 `sitecustomize.py` 会被备份
+而不是直接覆盖。
+
+产品每个版本会弹一次"本版改动"的通知窗口。默认**不动它**：一个去关自己没造成的
+窗口的 bridge，是在替键盘前的人做决定。
+
+| 环境变量 | 默认 | |
+| :--- | :--- | :--- |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_PORT` | `9001` | 服务端口 |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_HOST` | `localhost` | 绑定地址 |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_TIMEOUT` | `120` | 等待引擎和 Qt 的秒数 |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_CLOSE_NOTICE` | 关 | 设为 `1` 则关闭版本通知（无人值守启动） |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_LOG` | `%TEMP%\...` | 日志路径；空字符串则不记 |
+| `ITASCA_MCP_BRIDGE_ROOTS` | — | 供 `install` 搜索的根目录，`;` 分隔 |
+
+> `exe64/addon.py` 看起来像扩展点，其实不是：**没有任何东西读它**。用标记文件
+> 探针实测过——GUI 完全初始化之后标记依然不出现，而且 `addon.py` 在产品可执行
+> 文件里出现 **0 次**。真正会被导入的是 `sitecustomize.py`。
+
 ### 无头启动（由 agent 拉起）
 
 控制台构建会执行作为第一个参数传入的数据文件，因此 agent 可以自己把整套

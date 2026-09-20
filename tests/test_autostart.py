@@ -1,0 +1,287 @@
+"""Tests for the autostart hook — starting the bridge with the product.
+
+The hook runs during interpreter startup inside someone else's GUI, so the
+tests here are mostly about the ways it must *not* act: a plain interpreter
+that happens to live under a product directory (the self-upgrade runs pip
+with exactly that), a console build with no event loop, a second product
+starting when one bridge is already listening, and a sitecustomize.py that
+belongs to somebody else.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+from itasca_mcp_bridge import autostart
+
+
+# ---- which interpreters may arm ---------------------------------------
+
+# Built with the platform's own separator rather than written as Windows
+# literals: `os.path.basename` does not treat `\` as one on POSIX, so a
+# literal `D:\...\python.exe` is its own basename there and the negative
+# cases below would invert on CI. The real spelling on this machine is
+# `D:\Program Files\Itasca\PFC700\exe64\pfc2d700_gui.exe` next to
+# `...\exe64\python36\python.exe`.
+ENGINE = os.path.join("Itasca", "PFC700", "exe64")
+EMBEDDED_PYTHON = os.path.join(ENGINE, "python36", "python.exe")
+
+
+@pytest.mark.parametrize(
+    "executable",
+    [
+        os.path.join(ENGINE, "pfc2d700_gui.exe"),
+        os.path.join("Itasca", "FLAC3D700", "exe64", "flac3d700_gui.exe"),
+        os.path.join("Itasca", "3DEC700", "3dec700_console"),
+        os.path.join("Itasca", "MPoint700", "mpoint_gui.exe"),
+    ],
+)
+def test_engine_binaries_arm(executable):
+    assert autostart.is_engine_interpreter(executable) is True
+
+
+@pytest.mark.parametrize(
+    "executable",
+    [
+        # The package's own self-upgrade runs pip with this one. A substring
+        # test on the whole path would match "PFC700" and have a process that
+        # is about to exit poll for two minutes.
+        EMBEDDED_PYTHON,
+        os.path.join("Python36", "python.exe"),
+        os.path.join(os.sep, "usr", "bin", "python3"),
+        os.path.join("tools", "my_runner.exe"),
+    ],
+)
+def test_plain_interpreters_do_not_arm(executable):
+    assert autostart.is_engine_interpreter(executable) is False
+
+
+def test_engine_hints_are_overridable(monkeypatch):
+    monkeypatch.setenv(autostart.ENV_ENGINE_HINTS, "itascasoft")
+    assert autostart.is_engine_interpreter("itascasoft_gui.exe") is True
+    assert autostart.is_engine_interpreter("pfc2d700_gui.exe") is False
+
+
+# ---- boot() decides, and does not raise -------------------------------
+
+
+def test_boot_declines_on_a_plain_interpreter(monkeypatch):
+    started = []
+    monkeypatch.setattr(autostart.threading, "Thread", lambda **kw: started.append(kw))
+    monkeypatch.setattr(autostart.sys, "executable", "python.exe")
+    assert autostart.boot() is False
+    assert started == []
+
+
+def test_boot_declines_when_a_bridge_is_already_listening(monkeypatch, tmp_path):
+    started = []
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.setattr(autostart.sys, "executable", "pfc2d700_gui.exe")
+    monkeypatch.setattr(autostart, "port_in_use", lambda host, port, timeout=0.3: True)
+    monkeypatch.setattr(autostart.threading, "Thread", lambda **kw: started.append(kw))
+
+    assert autostart.boot() is False
+    assert started == []
+    assert "already in use" in (tmp_path / "autostart.log").read_text()
+
+
+def test_boot_arms_a_daemon_thread(monkeypatch, tmp_path):
+    created = {}
+
+    class _Thread:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+        def start(self):
+            created["started"] = True
+
+        def __setattr__(self, name, value):
+            created[name] = value
+
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.setattr(autostart.sys, "executable", "pfc2d700_gui.exe")
+    monkeypatch.setattr(autostart, "port_in_use", lambda host, port, timeout=0.3: False)
+    monkeypatch.setattr(autostart.threading, "Thread", _Thread)
+
+    assert autostart.boot() is True
+    assert created["started"] is True
+    assert created["daemon"] is True
+    assert created["name"] == "mcp-bridge-autostart"
+
+
+def test_boot_never_raises(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.setattr(autostart.sys, "executable", "pfc2d700_gui.exe")
+
+    def _explode(name, default):
+        raise RuntimeError("bad environment")
+
+    monkeypatch.setattr(autostart, "_env_float", _explode)
+    assert autostart.boot() is False
+
+
+# ---- the notice window ------------------------------------------------
+
+
+class _FakeWidget:
+    def __init__(self, title, visible=True, refuses=False):
+        self._title = title
+        self._visible = visible
+        self._refuses = refuses
+        self.closes = 0
+
+    def windowTitle(self):
+        return self._title
+
+    def isVisible(self):
+        return self._visible
+
+    def close(self):
+        self.closes += 1
+        if not self._refuses:
+            self._visible = False
+
+
+class _FakeApplication:
+    def __init__(self, widgets):
+        self._widgets = widgets
+
+    def topLevelWidgets(self):
+        return self._widgets
+
+
+class _FakeWidgets:
+    def __init__(self, widgets):
+        self.QApplication = _FakeApplication(widgets)
+
+
+def _with_widgets(monkeypatch, widgets):
+    monkeypatch.setattr(autostart, "_qt_widgets", lambda: _FakeWidgets(widgets))
+
+
+def test_closes_only_the_revision_notice(monkeypatch):
+    notice = _FakeWidget("PFC2D 7.00.161 : Startup")
+    document = _FakeWidget("Model - PFC2D 7.00.161")
+    _with_widgets(monkeypatch, [notice, document])
+
+    assert autostart.close_notice_windows() == ["PFC2D 7.00.161 : Startup"]
+    assert notice.closes == 1
+    assert document.closes == 0
+
+
+def test_a_notice_qt_refused_is_not_reported_as_closed(monkeypatch):
+    # Qt will not close a widget sitting inside a modal exec_(), and close()
+    # returns without raising, so the attempt alone proves nothing.
+    notice = _FakeWidget("PFC2D 7.00.161 : Startup", refuses=True)
+    _with_widgets(monkeypatch, [notice])
+
+    assert autostart.close_notice_windows() == []
+    assert notice.closes == 1
+
+
+def test_hidden_windows_are_skipped(monkeypatch):
+    notice = _FakeWidget("PFC2D 7.00.161 : Startup", visible=False)
+    _with_widgets(monkeypatch, [notice])
+
+    assert autostart.close_notice_windows() == []
+    assert notice.closes == 0
+
+
+def test_a_broken_widget_does_not_stop_the_sweep(monkeypatch):
+    class _Broken:
+        def isVisible(self):
+            raise RuntimeError("no")
+
+    notice = _FakeWidget("PFC2D 7.00.161 : Startup")
+    _with_widgets(monkeypatch, [_Broken(), notice])
+
+    assert autostart.close_notice_windows() == ["PFC2D 7.00.161 : Startup"]
+
+
+def test_no_qt_binding_is_not_an_error(monkeypatch):
+    monkeypatch.setattr(autostart, "_qt_widgets", lambda: None)
+    assert autostart.close_notice_windows() == []
+
+
+def test_notice_closing_is_off_unless_asked_for(monkeypatch):
+    monkeypatch.delenv(autostart.ENV_CLOSE_NOTICE, raising=False)
+    assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is False
+    monkeypatch.setenv(autostart.ENV_CLOSE_NOTICE, "1")
+    assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is True
+    monkeypatch.setenv(autostart.ENV_CLOSE_NOTICE, "off")
+    assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is False
+
+
+# ---- installing the shim ----------------------------------------------
+
+
+def test_shim_carries_the_marker_and_imports_the_module():
+    assert autostart.MARKER in autostart.SHIM
+    assert "from itasca_mcp_bridge.autostart import boot" in autostart.SHIM
+    # A shim, not a copy: the logic has to keep upgrading with the package.
+    assert "def _watch" not in autostart.SHIM
+
+
+def test_install_then_status_then_remove(tmp_path):
+    site_packages = str(tmp_path / "Lib" / "site-packages")
+    os.makedirs(site_packages)
+    path = autostart.target_of(site_packages)
+
+    assert autostart.state_of(path) == "absent"
+    assert autostart.install(site_packages) == "installed"
+    assert autostart.state_of(path) == "ours"
+    assert autostart.install(site_packages) == "refreshed"
+    assert autostart.remove(site_packages) == "removed"
+    assert autostart.state_of(path) == "absent"
+    assert autostart.remove(site_packages) == "nothing to remove"
+
+
+def test_a_foreign_sitecustomize_is_backed_up_not_lost(tmp_path):
+    site_packages = str(tmp_path / "Lib" / "site-packages")
+    os.makedirs(site_packages)
+    path = autostart.target_of(site_packages)
+    original = "# somebody else's sitecustomize\nX = 1\n"
+    with open(path, "w") as handle:
+        handle.write(original)
+
+    assert autostart.state_of(path) == "foreign"
+    result = autostart.install(site_packages)
+    assert result.startswith("replaced (backup at ")
+    assert autostart.state_of(path) == "ours"
+
+    # And removing ours puts theirs back, rather than leaving them without one.
+    assert autostart.remove(site_packages) == "removed (restored the previous file)"
+    with open(path) as handle:
+        assert handle.read() == original
+
+
+def test_remove_leaves_a_foreign_file_alone(tmp_path):
+    site_packages = str(tmp_path / "Lib" / "site-packages")
+    os.makedirs(site_packages)
+    path = autostart.target_of(site_packages)
+    with open(path, "w") as handle:
+        handle.write("SOMEONE_ELSES = True\n")
+
+    assert autostart.remove(site_packages) == "left alone (not this package's file)"
+    assert os.path.exists(path)
+
+
+# ---- finding the products ---------------------------------------------
+
+
+def test_products_are_found_once_each(tmp_path):
+    # Both spellings are probed because the case of that directory is not
+    # guaranteed, and on Windows they are the same directory. Without the
+    # de-duplication every product is reported -- and installed to -- twice.
+    python36 = tmp_path / "PFC700" / "exe64" / "python36"
+    os.makedirs(str(python36 / "Lib" / "site-packages"))
+    try:
+        (python36 / "lib").symlink_to(python36 / "Lib", target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("cannot link lib -> Lib here to exercise the aliasing")
+    # A product whose embedded Python is not there yet.
+    os.makedirs(str(tmp_path / "FLAC3D700" / "exe64"))
+
+    found = autostart.product_python_dirs([str(tmp_path)])
+    assert [product for product, _ in found] == ["PFC700"]
