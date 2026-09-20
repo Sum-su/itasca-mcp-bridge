@@ -124,23 +124,41 @@ making a call that belongs to the person at the keyboard.
 
 What the hook does do is *watch* those windows, for the life of the process,
 and report each new dialog once — whether or not it is allowed to close
-anything. A modal raised before the first engine command is the one failure
-that looks healthy from outside: it holds the product's main thread, so the
-bridge's HTTP server, which lives on a daemon thread, keeps answering 200
-while every submitted task hangs. `utils/modal_guard` cannot see it either,
-since that only polls while the bridge is inside an engine command. The log
-line is the only symptom:
+anything. A dialog raised before the first engine command is outside
+`utils/modal_guard`'s reach, since that only polls while the bridge is inside
+an engine command, and by definition nothing here is yet. It does **not** hang
+the bridge: a Qt modal runs a nested event loop and the task pump keeps
+ticking inside it (measured — a task still round-trips with the box up). What
+it breaks silently is `plot export bitmap`, which reports success and writes
+nothing at all — indistinguishable from a plot with nothing in it. For an
+agent, whose eyes are bitmap exports, that is the difference between a wrong
+picture and no picture. The log line is the only symptom:
 
 ```text
-a dialog is waiting for a human, leaving it alone: Recover Project File  (tasks will hang until it is answered)
+a dialog is waiting for a human, leaving it alone: Recover Project File  (the product is blocked on it, and plot exports write nothing)
 ```
+
+Setting `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS=1` turns the same pass
+into a hand. It closes the revision notice, and answers any dialog whose
+visible buttons are *all* acknowledgements — `Ok`, `Close`, `Continue`,
+`Dismiss`. Clicking one of those is not a decision: the box has exactly one
+possible outcome, so taking it leaves the person at the keyboard nothing they
+could have wanted instead. Everything else still stands and is still reported
+— a recovery prompt offering `Open`/`Discard`, a save confirmation with
+`OK`/`Cancel`, anything with a `Yes` beside its `No`. `close()` is not enough
+for these and that is not a stylistic point: Qt refuses to close a widget that
+is inside a modal `exec_()`, returns without raising, and the box stays up.
+Which is why a notice is *closed* and a no-choice dialog is *answered*. On
+PFC2D 7.00.161 the first answer produced two more, so this is a sweep rather
+than a click; the last of the three was an `Ok`-only box reporting an
+unrepeatable model state, which blocks the product and offers no way past.
 
 | Variable | Default | |
 | :--- | :--- | :--- |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_PORT` | `9001` | port to serve on |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_HOST` | `localhost` | interface to bind |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_TIMEOUT` | `120` | seconds to wait for the engine and Qt |
-| `ITASCA_MCP_BRIDGE_AUTOSTART_CLOSE_NOTICE` | off | set to `1` to close the revision notice (unattended starts) |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS` | off | set to `1` to close the revision notice and dismiss dialogs that ask nothing (unattended starts) |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_LOG` | `%TEMP%\...` | where to log; empty string logs nowhere |
 | `ITASCA_MCP_BRIDGE_ROOTS` | — | `;`-separated roots for `install` |
 

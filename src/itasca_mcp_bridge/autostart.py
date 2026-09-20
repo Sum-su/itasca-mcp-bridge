@@ -87,7 +87,7 @@ ENV_PORT = "ITASCA_MCP_BRIDGE_AUTOSTART_PORT"
 ENV_HOST = "ITASCA_MCP_BRIDGE_AUTOSTART_HOST"
 ENV_LOG = "ITASCA_MCP_BRIDGE_AUTOSTART_LOG"
 ENV_TIMEOUT = "ITASCA_MCP_BRIDGE_AUTOSTART_TIMEOUT"
-ENV_CLOSE_NOTICE = "ITASCA_MCP_BRIDGE_AUTOSTART_CLOSE_NOTICE"
+ENV_DISMISS_WINDOWS = "ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS"
 ENV_ENGINE_HINTS = "ITASCA_MCP_BRIDGE_AUTOSTART_ENGINE_HINTS"
 
 # Written into the file `install()` creates, and the first thing `status()`
@@ -109,6 +109,18 @@ ENGINE_HINTS = ("itasca", "pfc", "flac", "3dec", "mpoint", "massflow")
 # the person at the keyboard is doing, and it is raised on every start.
 BENIGN_SUFFIX = ": Startup"
 
+# Button labels that acknowledge rather than choose. A dialog whose visible
+# buttons are *all* in this set has exactly one possible outcome, so
+# clicking it is not a decision -- which is the line this module otherwise
+# refuses to cross. Measured on PFC2D 7.00.161: answering one dialog
+# produced another, so a start that stops at the first box stops at all of
+# them; an Ok-only box reporting an unrepeatable model state is the case
+# that matters, because it blocks the product and offers no way past.
+#
+# Deliberately short. "Yes" is not here: yes implies a no exists somewhere,
+# even when this particular box does not draw it.
+ACKNOWLEDGE_BUTTONS = ("ok", "close", "continue", "dismiss")
+
 # Held at module level: a QObject or QTimer with no owning reference is
 # garbage collected and stops working, which is the third trap above.
 _boot_object = None
@@ -117,6 +129,11 @@ _notice_timer = None
 # Titles already written to the log by the window watch, so a dialog left
 # standing is reported once rather than once a second.
 _reported_dialogs = set()
+
+# Titles this module has already clicked a button on. A click that does not
+# dismiss the box is worth making once, not once a second -- and whoever
+# survives the click is reported rather than retried.
+_attempted_dismissals = set()
 
 
 # ---- environment ------------------------------------------------------
@@ -314,6 +331,80 @@ def close_notice_windows():
     return closed
 
 
+def _button_labels(widget):
+    # type: (object) -> list
+    """Visible button labels, lowercased and stripped of ``&`` mnemonics."""
+    widgets = _qt_widgets()
+    if widgets is None:
+        return []
+    labels = []
+    try:
+        for button in widget.findChildren(widgets.QAbstractButton):
+            try:
+                if not button.isVisible():
+                    continue
+                labels.append(button.text().replace("&", "").strip().lower())
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return labels
+
+
+def _asks_nothing(widget):
+    # type: (object) -> bool
+    """Whether every visible button on this widget is an acknowledgement."""
+    labels = _button_labels(widget)
+    return bool(labels) and all(label in ACKNOWLEDGE_BUTTONS for label in labels)
+
+
+def dismiss_dialogs():
+    # type: () -> list
+    """Dismiss visible dialogs that offer no choice. Returns their titles.
+
+    ``close()`` is not enough here and this is not a stylistic choice: Qt
+    refuses to close a widget that is inside a modal ``exec_()`` and the
+    call returns without raising, so a box is only dismissed by *answering*
+    it. That is why this one clicks a button where the notice is merely
+    closed -- and why it runs only when every button it can see is an
+    acknowledgement. The moment a dialog offers a real alternative, there is
+    a decision in it and this leaves it standing for the person at the
+    keyboard, exactly as it does for a recovery prompt.
+
+    ``isVisible()`` is re-read rather than trusting the click, for the same
+    reason ``close_notice_windows()`` re-reads it.
+
+    Keyed on the title, so a box this run has already answered is left alone
+    if a same-titled one shows up later. The alternative is keying on the
+    widget, and holding a reference to a Qt widget in a set is how you get a
+    reference that outlives the C++ object behind it.
+    """
+    widgets = _qt_widgets()
+    if widgets is None:
+        return []
+
+    dismissed = []
+    for widget, title, is_dialog in _visible_windows():
+        if not is_dialog or title.endswith(BENIGN_SUFFIX):
+            continue
+        if title in _attempted_dismissals:
+            continue
+        if not _asks_nothing(widget):
+            continue
+        _attempted_dismissals.add(title)
+        try:
+            for button in widget.findChildren(widgets.QAbstractButton):
+                label = button.text().replace("&", "").strip().lower()
+                if button.isVisible() and label in ACKNOWLEDGE_BUTTONS:
+                    button.click()
+                    break
+            if not widget.isVisible():
+                dismissed.append(title)
+        except Exception:
+            continue
+    return dismissed
+
+
 def waiting_dialogs():
     # type: () -> list
     """Visible dialogs the hook will not answer. Returns their titles.
@@ -323,15 +414,22 @@ def waiting_dialogs():
     at the keyboard, and a recovery prompt answered by a startup hook is
     worse than one left standing.
 
-    Reporting is not a nicety. This hook exists so that nobody has to check
-    anything by hand, and the failure it is most likely to leave behind is
-    the one that looks healthy from outside: a modal raised before the first
-    engine command holds the product's main thread, so the bridge's HTTP
-    server -- which lives on a daemon thread -- keeps answering 200 while
-    every submitted task hangs. `modal_guard` cannot see this one; it only
-    runs while the bridge is inside an engine command, and by definition
-    nothing here is. Without a line in the log, the only symptom is that
-    tasks stopped working.
+    Reporting is not a nicety, because this box is the answer to a question
+    that is otherwise very hard to ask. A dialog raised before the first
+    engine command sits outside ``modal_guard``'s reach -- that only runs
+    while the bridge is inside an engine command, and by definition nothing
+    is -- so an unattended start that ends at a box nobody can see is a
+    product that looks started and does nothing. Measured on PFC2D 7.00.161:
+    with the recovery prompt up, ``plot export bitmap`` succeeds and writes
+    nothing at all, which is indistinguishable from a plot with nothing in
+    it. Bitmap export is how an agent sees, so this is the difference between
+    a wrong picture and no picture.
+
+    What it is *not* is a hung bridge: a Qt modal runs a nested event loop
+    and the task pump keeps ticking inside it (measured -- ``1+1`` still
+    round-trips with the box up). Native message boxes are the ones that
+    freeze the thread, and those are not ``QDialog``, so they never reach
+    this function.
     """
     return [
         title
@@ -379,9 +477,17 @@ def _schedule_window_watch(interval_ms=1000):
 
 def _tick_windows():
     # type: () -> None
-    if _env_flag(ENV_CLOSE_NOTICE, False):
+    if _env_flag(ENV_DISMISS_WINDOWS, False):
         for title in close_notice_windows():
             _log("closed the product's notice window: {}".format(title))
+
+    # Dismiss before reporting, so a box that gets cleared is never also
+    # announced. This has to be a sweep and not a single click: answering
+    # `Recover Project File` on PFC2D 7.00.161 produced two more dialogs,
+    # and the last of the three was the Ok-only one that blocks the product.
+    if _env_flag(ENV_DISMISS_WINDOWS, False):
+        for title in dismiss_dialogs():
+            _log("dismissed a dialog that asks nothing: {}".format(title))
 
     # Once each: a dialog nobody has answered is still up on the next tick,
     # and a log that repeats it every second is a log nobody reads.
@@ -389,9 +495,13 @@ def _tick_windows():
         if title in _reported_dialogs:
             continue
         _reported_dialogs.add(title)
+        # Not "tasks will hang": a Qt modal runs a nested event loop and the
+        # pump keeps ticking inside it, measured. What it does silently break
+        # is bitmap export -- see waiting_dialogs().
         _log(
             "a dialog is waiting for a human, leaving it alone: {}"
-            "  (tasks will hang until it is answered)".format(title)
+            "  (the product is blocked on it, and plot exports write nothing)"
+            .format(title)
         )
 
 

@@ -111,22 +111,34 @@ $ python -m itasca_mcp_bridge autostart remove
 窗口的 bridge，是在替键盘前的人做决定。
 
 钩子会做的是**看着**这些窗口，看一整个进程生命周期，每冒出一个新弹窗就记一次
-——不管有没有被允许去关。**第一条引擎命令之前冒出来的模态弹窗是最阴的一种故障，
-因为从外面看它是健康的**：它占着产品主线程，而 bridge 的 HTTP 服务在守护线程上，
-于是端口照收、`/health` 照回 200，**每一个提交的任务都吊死**。`utils/modal_guard`
-也看不见它——那个只在 bridge 正处在一条引擎命令里的时候才轮询。日志里那一行是唯一
-的症状：
+——不管有没有被允许去关。第一条引擎命令之前冒出来的弹窗在 `utils/modal_guard`
+的视野之外（那个只在 bridge 正处在一条引擎命令里的时候才轮询，而这里什么都还没有）。
+它**不会**吊死 bridge：Qt 模态弹窗跑的是嵌套事件循环，任务泵在里面照常 tick
+（实测——弹窗挂着时任务仍然往返成功）。它静默弄坏的是 `plot export bitmap`：
+命令报成功，**什么都不写**，和"这个 plot 本来就是空的"完全分不出来。对 agent 来说，
+位图导出就是眼睛，所以这是"错的图"和"没有图"之间的差别。日志里那一行是唯一的症状：
 
 ```text
-a dialog is waiting for a human, leaving it alone: Recover Project File  (tasks will hang until it is answered)
+a dialog is waiting for a human, leaving it alone: Recover Project File  (the product is blocked on it, and plot exports write nothing)
 ```
+
+设 `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS=1` 会把同一趟巡查变成一只手：
+关掉版本通知，并且**回答**那些可见按钮全是确认类的弹窗——`Ok`、`Close`、
+`Continue`、`Dismiss`。点这种按钮不算做决定：整个弹窗只有一种可能的结果，
+替它点完，键盘前的人并没有损失任何他本可能想要的东西。其余的一律原样留着、
+照样上报——带 `Open`/`Discard` 的恢复提示、`OK`/`Cancel` 的保存确认、任何
+`Yes` 旁边有 `No` 的东西。这类盒子 `close()` 是关不掉的，这不是风格问题：
+Qt 会拒绝关闭一个正处在模态 `exec_()` 里的 widget，不抛异常直接返回，盒子还在
+——所以通知是**关**的，没得选的弹窗是**答**的。在 PFC2D 7.00.161 上，答完第一个
+又冒出两个，所以这里是扫而不是点一下；三个里的最后一个是只带 `Ok` 的"模型状态
+当前标记为不可重复"，它会挡住产品，而且不给你任何绕过去的路。
 
 | 环境变量 | 默认 | |
 | :--- | :--- | :--- |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_PORT` | `9001` | 服务端口 |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_HOST` | `localhost` | 绑定地址 |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_TIMEOUT` | `120` | 等待引擎和 Qt 的秒数 |
-| `ITASCA_MCP_BRIDGE_AUTOSTART_CLOSE_NOTICE` | 关 | 设为 `1` 则关闭版本通知（无人值守启动） |
+| `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS` | 关 | 设为 `1` 则关闭版本通知，并回答没得选的弹窗（无人值守启动） |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_LOG` | `%TEMP%\...` | 日志路径；空字符串则不记 |
 | `ITASCA_MCP_BRIDGE_ROOTS` | — | 供 `install` 搜索的根目录，`;` 分隔 |
 

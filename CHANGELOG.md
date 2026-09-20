@@ -21,12 +21,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hangs. Console builds are left alone, an existing `sitecustomize.py` that
   is not ours is backed up rather than replaced, and nothing is started when
   a bridge is already listening on the port. The hook watches the product's
-  windows for the life of the process and reports each new dialog once.
-  Closing the product's per-revision notice window is available but off by
-  default; the reporting half is not, because a modal raised before the first
-  engine command holds the product's main thread and leaves the bridge
-  answering 200 while every submitted task hangs -- a failure whose only
-  other symptom is that tasks stopped working.
+  windows for the life of the process and reports each new dialog once. A
+  modal raised before the first engine command is outside
+  `utils/modal_guard`'s reach, which only polls while the bridge is inside an
+  engine command, and by definition nothing here is yet. It does not hang the
+  bridge -- a Qt modal runs a nested event loop and the task pump keeps
+  ticking inside it, measured -- but it breaks `plot export bitmap` silently,
+  which reports success and writes nothing at all, and for an agent whose
+  eyes are bitmap exports that is the difference between a wrong picture and
+  no picture. The log line is the only symptom.
+
+  `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS=1` opts into acting on that
+  watch: it closes the revision notice and answers any dialog whose visible
+  buttons are all acknowledgements (`Ok`, `Close`, `Continue`, `Dismiss`). A
+  box like that has exactly one possible outcome, so answering it is not a
+  decision -- and it is the only way past the `Ok`-only "model state is
+  currently marked as unrepeatable" box, which otherwise blocks the product
+  for good. Everything else stays standing and is still reported, including
+  `Open`/`Discard` recovery prompts and `OK`/`Cancel` confirmations.
+  `close()` is not an option for these: Qt refuses to close a widget inside a
+  modal `exec_()` and returns without raising, which is why a notice is
+  closed and a no-choice dialog is answered. On PFC2D 7.00.161 answering the
+  first box produced two more, so the pass repeats until nothing is left.
 
   (`exe64/addon.py`, which looks like the intended extension point, is not:
   a marker-file probe never fires, GUI fully initialised, and the name occurs

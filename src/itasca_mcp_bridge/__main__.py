@@ -84,10 +84,12 @@ def _autostart(args):
         )
         print("The hook logs to {}.".format(autostart.log_path()))
         print("")
-        print("The product's per-revision notice window is left alone by default.")
+        print("Dialogs are left alone by default; the hook says in its log when one")
+        print("is waiting for a human. Set")
         print(
-            "Set {}=1 to close it (useful unattended).".format(autostart.ENV_CLOSE_NOTICE)
+            "{}=1 to close the revision".format(autostart.ENV_DISMISS_WINDOWS)
         )
+        print("notice and to dismiss dialogs that offer no choice (useful unattended).")
     elif args.action == "remove" and changed:
         print("")
         print("Restart the product for the change to take effect.")

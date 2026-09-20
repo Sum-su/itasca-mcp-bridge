@@ -124,11 +124,34 @@ def test_boot_never_raises(monkeypatch, tmp_path):
 # ---- the notice window ------------------------------------------------
 
 
+class _FakeButton:
+    """One button on a dialog. Clicking the right one is what dismisses it."""
+
+    def __init__(self, text, owner, visible=True, dismisses=True):
+        self._text = text
+        self._owner = owner
+        self._visible = visible
+        self._dismisses = dismisses
+        self.clicks = 0
+
+    def text(self):
+        return self._text
+
+    def isVisible(self):
+        return self._visible
+
+    def click(self):
+        self.clicks += 1
+        if self._dismisses:
+            self._owner._visible = False
+
+
 class _FakeWidget:
-    def __init__(self, title, visible=True, refuses=False):
+    def __init__(self, title, visible=True, refuses=False, buttons=()):
         self._title = title
         self._visible = visible
         self._refuses = refuses
+        self.buttons = list(buttons)
         self.closes = 0
 
     def windowTitle(self):
@@ -142,9 +165,19 @@ class _FakeWidget:
         if not self._refuses:
             self._visible = False
 
+    def findChildren(self, kind):
+        return list(self.buttons) if kind is _FakeButton else []
+
 
 class _FakeDialog(_FakeWidget):
     """A widget that asks something. `QDialog` is the hook's only test for it."""
+
+
+def _dialog(title, *labels, **kwargs):
+    """A dialog carrying buttons, so `dismissible` has something to read."""
+    dialog = _FakeDialog(title, **kwargs)
+    dialog.buttons = [_FakeButton(label, dialog) for label in labels]
+    return dialog
 
 
 class _FakeApplication:
@@ -157,6 +190,7 @@ class _FakeApplication:
 
 class _FakeWidgets:
     QDialog = _FakeDialog
+    QAbstractButton = _FakeButton
     QApplication = None
 
     def __init__(self, widgets):
@@ -166,6 +200,7 @@ class _FakeWidgets:
 def _with_widgets(monkeypatch, widgets):
     monkeypatch.setattr(autostart, "_qt_widgets", lambda: _FakeWidgets(widgets))
     monkeypatch.setattr(autostart, "_reported_dialogs", set())
+    monkeypatch.setattr(autostart, "_attempted_dismissals", set())
 
 
 def test_closes_only_the_revision_notice(monkeypatch):
@@ -213,12 +248,12 @@ def test_no_qt_binding_is_not_an_error(monkeypatch):
 
 
 def test_notice_closing_is_off_unless_asked_for(monkeypatch):
-    monkeypatch.delenv(autostart.ENV_CLOSE_NOTICE, raising=False)
-    assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is False
-    monkeypatch.setenv(autostart.ENV_CLOSE_NOTICE, "1")
-    assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is True
-    monkeypatch.setenv(autostart.ENV_CLOSE_NOTICE, "off")
-    assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is False
+    monkeypatch.delenv(autostart.ENV_DISMISS_WINDOWS, raising=False)
+    assert autostart._env_flag(autostart.ENV_DISMISS_WINDOWS, False) is False
+    monkeypatch.setenv(autostart.ENV_DISMISS_WINDOWS, "1")
+    assert autostart._env_flag(autostart.ENV_DISMISS_WINDOWS, False) is True
+    monkeypatch.setenv(autostart.ENV_DISMISS_WINDOWS, "off")
+    assert autostart._env_flag(autostart.ENV_DISMISS_WINDOWS, False) is False
 
 
 # ---- dialogs the hook will not answer ---------------------------------
@@ -269,7 +304,7 @@ def test_a_dialog_is_reported_even_when_closing_is_turned_off(monkeypatch, tmp_p
     # survive on a default install, because it is the only symptom of a
     # bridge whose HTTP server answers while every task hangs.
     monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
-    monkeypatch.delenv(autostart.ENV_CLOSE_NOTICE, raising=False)
+    monkeypatch.delenv(autostart.ENV_DISMISS_WINDOWS, raising=False)
     notice = _FakeWidget("PFC2D 7.00.161 : Startup")
     _with_widgets(monkeypatch, [notice, _FakeDialog("Recover Project File")])
 
@@ -282,7 +317,7 @@ def test_a_dialog_is_reported_even_when_closing_is_turned_off(monkeypatch, tmp_p
 
 def test_closing_is_the_opt_in_half_of_the_same_pass(monkeypatch, tmp_path):
     monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
-    monkeypatch.setenv(autostart.ENV_CLOSE_NOTICE, "1")
+    monkeypatch.setenv(autostart.ENV_DISMISS_WINDOWS, "1")
     notice = _FakeWidget("PFC2D 7.00.161 : Startup")
     _with_widgets(monkeypatch, [notice])
 
@@ -290,6 +325,131 @@ def test_closing_is_the_opt_in_half_of_the_same_pass(monkeypatch, tmp_path):
 
     assert notice.closes == 1
     assert "closed the product's notice window: PFC2D 7.00.161 : Startup" in _log_of(tmp_path)
+
+
+# ---- dialogs that ask nothing -----------------------------------------
+
+
+def test_a_box_with_one_ok_is_answered(monkeypatch):
+    # Measured on PFC2D 7.00.161: this is the box that blocks the product and
+    # offers no way past it.
+    dialog = _dialog("PFC2D 7.00", "Ok")
+    _with_widgets(monkeypatch, [dialog])
+
+    assert autostart.dismiss_dialogs() == ["PFC2D 7.00"]
+    assert dialog.buttons[0].clicks == 1
+
+
+def test_a_box_that_offers_a_choice_is_left_standing(monkeypatch):
+    # `close()` cannot dismiss these -- Qt refuses inside a modal exec_() --
+    # and answering one means picking for somebody. So they stay.
+    dialog = _dialog("Recover Project File", "Open", "Discard")
+    _with_widgets(monkeypatch, [dialog])
+
+    assert autostart.dismiss_dialogs() == []
+    assert dialog.buttons[0].clicks == 0
+    assert dialog.buttons[1].clicks == 0
+
+
+def test_a_yes_is_a_choice_even_with_no_visible_no(monkeypatch):
+    # "Yes" implies a "No" exists somewhere, so it is not in the
+    # acknowledgement set even when this particular box does not draw it.
+    dialog = _dialog("Restore save file initial.sav?", "Yes", "No")
+    _with_widgets(monkeypatch, [dialog])
+
+    assert autostart.dismiss_dialogs() == []
+    assert dialog.buttons[0].clicks == 0
+
+
+def test_an_ok_cancel_box_is_a_choice(monkeypatch):
+    dialog = _dialog("Are you sure you want to restore save file initial.sav?", "OK", "Cancel")
+    _with_widgets(monkeypatch, [dialog])
+
+    assert autostart.dismiss_dialogs() == []
+    assert dialog.buttons[0].clicks == 0
+
+
+def test_the_notice_is_not_a_dialog_to_answer(monkeypatch):
+    # It is closed by the other half of the pass; answering it here would
+    # have the same window logged twice under two different verbs.
+    notice = _dialog("PFC2D 7.00.161 : Startup", "Ok")
+    _with_widgets(monkeypatch, [notice])
+
+    assert autostart.dismiss_dialogs() == []
+    assert notice.buttons[0].clicks == 0
+
+
+def test_a_box_with_no_visible_buttons_is_not_answered(monkeypatch):
+    # Nothing to click means nothing to read: an empty label set is not the
+    # same as a set of acknowledgements, and treating it as one would have
+    # the hook guessing at a window it cannot see into.
+    hidden = _dialog("PFC2D 7.00", "Ok")
+    hidden.buttons[0]._visible = False
+    _with_widgets(monkeypatch, [hidden])
+
+    assert autostart.dismiss_dialogs() == []
+
+
+def test_a_click_that_does_not_dismiss_is_not_reported_as_one(monkeypatch):
+    # Real Qt can refuse. `isVisible()` is re-read instead of the click
+    # being trusted, exactly as the notice sweep does.
+    dialog = _dialog("PFC2D 7.00", "Ok")
+    dialog.buttons[0]._dismisses = False
+    _with_widgets(monkeypatch, [dialog])
+
+    assert autostart.dismiss_dialogs() == []
+    assert dialog.buttons[0].clicks == 1
+
+
+def test_a_refusing_button_is_clicked_once_not_once_a_second(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.setenv(autostart.ENV_DISMISS_WINDOWS, "1")
+    dialog = _dialog("PFC2D 7.00", "Ok")
+    dialog.buttons[0]._dismisses = False
+    _with_widgets(monkeypatch, [dialog])
+
+    autostart._tick_windows()
+    autostart._tick_windows()
+    autostart._tick_windows()
+
+    assert dialog.buttons[0].clicks == 1
+    # And what survives the click is reported, because it is still in the way.
+    assert "a dialog is waiting for a human" in _log_of(tmp_path)
+
+
+def test_a_chain_of_boxes_is_cleared_in_one_tick(monkeypatch, tmp_path):
+    # Answering the first box on PFC2D 7.00.161 produced two more, so the
+    # pass has to repeat. Each tick re-reads the widget list, so a queue
+    # that grows while it is being drained still gets drained.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.setenv(autostart.ENV_DISMISS_WINDOWS, "1")
+    first = _dialog("Recover Project File", "Open", "Discard")
+    second = _dialog("Are you sure you want to restore save file initial.sav?", "OK", "Cancel")
+    third = _dialog("PFC2D 7.00", "Ok")
+    _with_widgets(monkeypatch, [first, second, third])
+
+    autostart._tick_windows()
+
+    # The two that ask something are untouched; the one that does not is gone.
+    assert first.buttons[0].clicks == 0
+    assert second.buttons[0].clicks == 0
+    assert third.buttons[0].clicks == 1
+    # And the two that were answered by nobody are named in the log.
+    log = _log_of(tmp_path)
+    assert "Recover Project File" in log
+    assert "save file initial.sav" in log
+
+
+def test_answering_is_opt_in_and_off_by_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.delenv(autostart.ENV_DISMISS_WINDOWS, raising=False)
+    dialog = _dialog("PFC2D 7.00", "Ok")
+    _with_widgets(monkeypatch, [dialog])
+
+    autostart._tick_windows()
+
+    assert dialog.buttons[0].clicks == 0
+    assert "PFC2D 7.00" in _log_of(tmp_path)
 
 
 # ---- installing the shim ----------------------------------------------
