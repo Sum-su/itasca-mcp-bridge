@@ -143,6 +143,10 @@ class _FakeWidget:
             self._visible = False
 
 
+class _FakeDialog(_FakeWidget):
+    """A widget that asks something. `QDialog` is the hook's only test for it."""
+
+
 class _FakeApplication:
     def __init__(self, widgets):
         self._widgets = widgets
@@ -152,12 +156,16 @@ class _FakeApplication:
 
 
 class _FakeWidgets:
+    QDialog = _FakeDialog
+    QApplication = None
+
     def __init__(self, widgets):
         self.QApplication = _FakeApplication(widgets)
 
 
 def _with_widgets(monkeypatch, widgets):
     monkeypatch.setattr(autostart, "_qt_widgets", lambda: _FakeWidgets(widgets))
+    monkeypatch.setattr(autostart, "_reported_dialogs", set())
 
 
 def test_closes_only_the_revision_notice(monkeypatch):
@@ -211,6 +219,77 @@ def test_notice_closing_is_off_unless_asked_for(monkeypatch):
     assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is True
     monkeypatch.setenv(autostart.ENV_CLOSE_NOTICE, "off")
     assert autostart._env_flag(autostart.ENV_CLOSE_NOTICE, False) is False
+
+
+# ---- dialogs the hook will not answer ---------------------------------
+
+
+def test_a_dialog_is_reported_and_the_window_behind_it_is_not(monkeypatch):
+    dialog = _FakeDialog("Recover Project File")
+    document = _FakeWidget("Model - PFC2D 7.00.161")
+    _with_widgets(monkeypatch, [dialog, document])
+
+    # A plain top-level window is not a question, and reporting it would
+    # bury the one that is.
+    assert autostart.waiting_dialogs() == ["Recover Project File"]
+    # Reported, not answered: this one is offering a choice.
+    assert dialog.closes == 0
+
+
+def test_the_startup_notice_is_not_a_waiting_dialog(monkeypatch):
+    _with_widgets(monkeypatch, [_FakeDialog("PFC2D 7.00.161 : Startup")])
+    assert autostart.waiting_dialogs() == []
+
+
+def test_hidden_dialogs_are_not_waiting(monkeypatch):
+    # A dialog the product has already dismissed is not holding anything.
+    _with_widgets(monkeypatch, [_FakeDialog("Recover Project File", visible=False)])
+    assert autostart.waiting_dialogs() == []
+
+
+def _log_of(tmp_path):
+    return (tmp_path / "autostart.log").read_text()
+
+
+def test_a_waiting_dialog_is_logged_once_not_once_a_second(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    _with_widgets(monkeypatch, [_FakeDialog("Recover Project File")])
+
+    autostart._tick_windows()
+    autostart._tick_windows()
+    autostart._tick_windows()
+
+    # The dialog is still up on every tick. A log that says so thirty times a
+    # minute is a log nobody reads, which is the same as no log.
+    assert _log_of(tmp_path).count("Recover Project File") == 1
+
+
+def test_a_dialog_is_reported_even_when_closing_is_turned_off(monkeypatch, tmp_path):
+    # The two halves of the pass are independent: this is the one that has to
+    # survive on a default install, because it is the only symptom of a
+    # bridge whose HTTP server answers while every task hangs.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.delenv(autostart.ENV_CLOSE_NOTICE, raising=False)
+    notice = _FakeWidget("PFC2D 7.00.161 : Startup")
+    _with_widgets(monkeypatch, [notice, _FakeDialog("Recover Project File")])
+
+    autostart._tick_windows()
+
+    assert "Recover Project File" in _log_of(tmp_path)
+    assert "closed the product's notice window" not in _log_of(tmp_path)
+    assert notice.closes == 0
+
+
+def test_closing_is_the_opt_in_half_of_the_same_pass(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.setenv(autostart.ENV_CLOSE_NOTICE, "1")
+    notice = _FakeWidget("PFC2D 7.00.161 : Startup")
+    _with_widgets(monkeypatch, [notice])
+
+    autostart._tick_windows()
+
+    assert notice.closes == 1
+    assert "closed the product's notice window: PFC2D 7.00.161 : Startup" in _log_of(tmp_path)
 
 
 # ---- installing the shim ----------------------------------------------

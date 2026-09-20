@@ -110,6 +110,17 @@ $ python -m itasca_mcp_bridge autostart remove
 产品每个版本会弹一次"本版改动"的通知窗口。默认**不动它**：一个去关自己没造成的
 窗口的 bridge，是在替键盘前的人做决定。
 
+钩子会做的是**看着**这些窗口，看一整个进程生命周期，每冒出一个新弹窗就记一次
+——不管有没有被允许去关。**第一条引擎命令之前冒出来的模态弹窗是最阴的一种故障，
+因为从外面看它是健康的**：它占着产品主线程，而 bridge 的 HTTP 服务在守护线程上，
+于是端口照收、`/health` 照回 200，**每一个提交的任务都吊死**。`utils/modal_guard`
+也看不见它——那个只在 bridge 正处在一条引擎命令里的时候才轮询。日志里那一行是唯一
+的症状：
+
+```text
+a dialog is waiting for a human, leaving it alone: Recover Project File  (tasks will hang until it is answered)
+```
+
 | 环境变量 | 默认 | |
 | :--- | :--- | :--- |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_PORT` | `9001` | 服务端口 |

@@ -114,6 +114,10 @@ BENIGN_SUFFIX = ": Startup"
 _boot_object = None
 _notice_timer = None
 
+# Titles already written to the log by the window watch, so a dialog left
+# standing is reported once rather than once a second.
+_reported_dialogs = set()
+
 
 # ---- environment ------------------------------------------------------
 
@@ -255,6 +259,32 @@ def _qt_widgets():
     return None
 
 
+def _visible_windows():
+    # type: () -> list
+    """Visible top-level widgets as ``(widget, title, is_dialog)``, or []."""
+    widgets = _qt_widgets()
+    if widgets is None:
+        return []
+    found = []
+    try:
+        for widget in widgets.QApplication.topLevelWidgets():
+            try:
+                if not widget.isVisible():
+                    continue
+                found.append(
+                    (
+                        widget,
+                        widget.windowTitle(),
+                        isinstance(widget, widgets.QDialog),
+                    )
+                )
+            except Exception:
+                continue
+    except Exception:
+        return found
+    return found
+
+
 def close_notice_windows():
     # type: () -> list
     """Close the product's revision notice. Returns the titles closed.
@@ -271,30 +301,48 @@ def close_notice_windows():
     ``exec_()`` and ``close()`` returns without raising, so counting the
     attempt would report a dismissal that never happened.
     """
-    widgets = _qt_widgets()
-    if widgets is None:
-        return []
     closed = []
-    try:
-        for widget in widgets.QApplication.topLevelWidgets():
-            try:
-                if not widget.isVisible():
-                    continue
-                if not widget.windowTitle().endswith(BENIGN_SUFFIX):
-                    continue
-                widget.close()
-                if not widget.isVisible():
-                    closed.append(widget.windowTitle())
-            except Exception:
-                continue
-    except Exception:
-        return closed
+    for widget, title, _ in _visible_windows():
+        if not title.endswith(BENIGN_SUFFIX):
+            continue
+        try:
+            widget.close()
+            if not widget.isVisible():
+                closed.append(title)
+        except Exception:
+            continue
     return closed
 
 
-def _schedule_notice_sweep(interval_ms=1000):
+def waiting_dialogs():
+    # type: () -> list
+    """Visible dialogs the hook will not answer. Returns their titles.
+
+    Reported, never answered -- the same line ``utils/modal_guard`` draws,
+    for the same reason: a box offering a choice is offering it to the person
+    at the keyboard, and a recovery prompt answered by a startup hook is
+    worse than one left standing.
+
+    Reporting is not a nicety. This hook exists so that nobody has to check
+    anything by hand, and the failure it is most likely to leave behind is
+    the one that looks healthy from outside: a modal raised before the first
+    engine command holds the product's main thread, so the bridge's HTTP
+    server -- which lives on a daemon thread -- keeps answering 200 while
+    every submitted task hangs. `modal_guard` cannot see this one; it only
+    runs while the bridge is inside an engine command, and by definition
+    nothing here is. Without a line in the log, the only symptom is that
+    tasks stopped working.
+    """
+    return [
+        title
+        for _, title, is_dialog in _visible_windows()
+        if is_dialog and not title.endswith(BENIGN_SUFFIX)
+    ]
+
+
+def _schedule_window_watch(interval_ms=1000):
     # type: (int) -> bool
-    """Close notices for the life of the process, not just at startup.
+    """Look at the product's windows for the life of the process.
 
     A one-shot sweep at start-up is not enough, and that is what makes this
     worth a timer: the notice is not necessarily up when the bridge comes
@@ -302,6 +350,11 @@ def _schedule_notice_sweep(interval_ms=1000):
     OK" and the notice appeared 25 seconds later, after a "Recover Project
     File" prompt was answered. A window nobody dismissed keeps coming back
     to the front, so the only reliable answer is to keep looking.
+
+    Armed whether or not closing is turned on, because the reporting half is
+    worth having either way and the two are one pass over the same list.
+    `modal_guard` already polls at 25 ms for the whole life of the process;
+    this is the same shape at a fortieth of the rate.
     """
     global _notice_timer
 
@@ -315,19 +368,31 @@ def _schedule_notice_sweep(interval_ms=1000):
             _notice_timer.stop()
         timer = QtCore.QTimer()
         timer.setInterval(int(interval_ms))
-        timer.timeout.connect(_tick_notice)
+        timer.timeout.connect(_tick_windows)
         timer.start()
     except Exception as exc:
-        _log("notice sweep could not start: {!r}".format(exc))
+        _log("window watch could not start: {!r}".format(exc))
         return False
     _notice_timer = timer
     return True
 
 
-def _tick_notice():
+def _tick_windows():
     # type: () -> None
-    for title in close_notice_windows():
-        _log("closed the product's notice window: {}".format(title))
+    if _env_flag(ENV_CLOSE_NOTICE, False):
+        for title in close_notice_windows():
+            _log("closed the product's notice window: {}".format(title))
+
+    # Once each: a dialog nobody has answered is still up on the next tick,
+    # and a log that repeats it every second is a log nobody reads.
+    for title in waiting_dialogs():
+        if title in _reported_dialogs:
+            continue
+        _reported_dialogs.add(title)
+        _log(
+            "a dialog is waiting for a human, leaving it alone: {}"
+            "  (tasks will hang until it is answered)".format(title)
+        )
 
 
 # ---- boot -------------------------------------------------------------
@@ -349,11 +414,11 @@ def _on_application_thread(host, port):
     except Exception as exc:
         _log("start() failed: {!r}".format(exc))
     finally:
-        # Outside the try: a notice in the user's face is worth closing
-        # whether or not the bridge came up.
-        if _env_flag(ENV_CLOSE_NOTICE, False):
-            if _schedule_notice_sweep():
-                _log("watching for the product's notice window")
+        # Outside the try: a dialog in the user's face is worth reporting
+        # whether or not the bridge came up. Closing is the opt-in half --
+        # see _tick_windows.
+        if _schedule_window_watch():
+            _log("watching the product's windows")
 
 
 def _watch(host, port, timeout_s):

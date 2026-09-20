@@ -20,8 +20,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   looks like success: `/health` answers 200 while every submitted task
   hangs. Console builds are left alone, an existing `sitecustomize.py` that
   is not ours is backed up rather than replaced, and nothing is started when
-  a bridge is already listening on the port. Closing the product's
-  per-revision notice window is available but off by default.
+  a bridge is already listening on the port. The hook watches the product's
+  windows for the life of the process and reports each new dialog once.
+  Closing the product's per-revision notice window is available but off by
+  default; the reporting half is not, because a modal raised before the first
+  engine command holds the product's main thread and leaves the bridge
+  answering 200 while every submitted task hangs -- a failure whose only
+  other symptom is that tasks stopped working.
 
   (`exe64/addon.py`, which looks like the intended extension point, is not:
   a marker-file probe never fires, GUI fully initialised, and the name occurs

@@ -122,6 +122,19 @@ The product raises a per-revision notice window listing what changed. It is
 left alone by default: a bridge that closes windows it did not cause is
 making a call that belongs to the person at the keyboard.
 
+What the hook does do is *watch* those windows, for the life of the process,
+and report each new dialog once — whether or not it is allowed to close
+anything. A modal raised before the first engine command is the one failure
+that looks healthy from outside: it holds the product's main thread, so the
+bridge's HTTP server, which lives on a daemon thread, keeps answering 200
+while every submitted task hangs. `utils/modal_guard` cannot see it either,
+since that only polls while the bridge is inside an engine command. The log
+line is the only symptom:
+
+```text
+a dialog is waiting for a human, leaving it alone: Recover Project File  (tasks will hang until it is answered)
+```
+
 | Variable | Default | |
 | :--- | :--- | :--- |
 | `ITASCA_MCP_BRIDGE_AUTOSTART_PORT` | `9001` | port to serve on |
