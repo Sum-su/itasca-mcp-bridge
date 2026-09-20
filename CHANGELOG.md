@@ -43,6 +43,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   modal `exec_()` and returns without raising, which is why a notice is
   closed and a no-choice dialog is answered. On PFC2D 7.00.161 answering the
   first box produced two more, so the pass repeats until nothing is left.
+- `list_dialogs` and `answer_dialog` commands, and a matching `GET /dialogs`
+  route, which publish what the product is asking and let a client answer it.
+  The snapshot -- title, body text and button labels -- is read off the
+  widgets by the GUI thread and arrives as strings, because a Qt widget
+  touched from a request thread is a crash with a delay on it. Bodies come
+  from `QMessageBox.text()` and from child labels: ITASCA's own boxes are
+  plain `QWidget`s and keep theirs in labels. Ids are handed out once per
+  title and the label is matched against the buttons actually present, so
+  an id that has since been reused cannot click whatever moved under it.
+
+  This exists because the `DISMISS_WINDOWS` policy above is a decision made
+  in advance, and the boxes nobody has seen yet are exactly the ones it
+  cannot cover. The click is carried out on the GUI thread by the window
+  watch -- the same hop `start()` needs, without a second queued object,
+  since the watch is already on the right thread -- and the request waits
+  for that pass and withdraws itself when nothing picks it up, rather than
+  returning success into an empty room.
 
   (`exe64/addon.py`, which looks like the intended extension point, is not:
   a marker-file probe never fires, GUI fully initialised, and the name occurs

@@ -64,6 +64,11 @@ JSON 响应回显同一个 `request_id`。服务端→客户端门铃通过一�
 | `list_tasks` | 列出已知任务 | `offset`、`limit` |
 | `interrupt_task` | 请求优雅中断运行中的任务 | `task_id` |
 | `execute_code` | 在运行中任务的 `__main__` 里执行片段（同步 REPL） | `code`、`timeout_ms` |
+| `list_dialogs` | 产品正在问什么，以及它拿什么按钮在问 | — |
+| `answer_dialog` | 点其中某一个按钮 | `id`、`button` |
+
+`GET /dialogs` 与 `list_dialogs` 是同一份负载，给只会用 curl 的客户端。
+用途见[随产品一起启动](#随产品一起启动)。
 
 ## 快速开始
 
@@ -132,6 +137,39 @@ Qt 会拒绝关闭一个正处在模态 `exec_()` 里的 widget，不抛异常�
 ——所以通知是**关**的，没得选的弹窗是**答**的。在 PFC2D 7.00.161 上，答完第一个
 又冒出两个，所以这里是扫而不是点一下；三个里的最后一个是只带 `Ok` 的"模型状态
 当前标记为不可重复"，它会挡住产品，而且不给你任何绕过去的路。
+
+这个开关是钩子**自己的**策略，而事先写下的策略覆盖不了还没人见过的弹窗——
+谁的机器上只有手上这一个版本的软件，谁就正好处在这个位置上。所以同一趟巡查
+还会把它看到的东西发布出去，让客户端自己来答：
+
+```console
+$ curl -s localhost:9001/dialogs
+{"status": "success", "data": {"dialogs": [
+  {"id": 1, "title": "Recover Project File",
+   "text": "The project file was not saved...",
+   "buttons": ["Open", "Discard"], "asks_nothing": false}]}}
+
+$ curl -s -X POST localhost:9001/answer_dialog \
+    -d '{"request_id":"1","id":1,"button":"Open"}'
+```
+
+快照由 GUI 线程从 widget 上读下来，到手就已经是字符串：标题、正文、以及按钮上的
+文字。客户端读它、判断、然后拿里面的 id 和标签回帖。id 按标题发一次就不再变，
+标签则要跟弹窗上真实存在的按钮对上——这样一条已经被回收再用的 id 不可能点到
+它底下换进来的别的东西。
+
+这一切都不是自动的。点击发生在 GUI 线程、在下一趟巡查里——和 `start()` 需要的是
+同一个跳转，只是不用再排一个 QObject，因为巡查本来就已经在那儿、本来就在对的线程上。
+请求会等那一趟回来报告结果，等不到就**自己撤回**，而不是对着空房间回 success：
+排进队列却没人接，正是这个模块存在的全部理由。如果产品是控制台构建，或者 bridge
+是手工从控制台起的，那就没有巡查，回答会直说这一点。正文既读 `QMessageBox.text()`
+也读子 label，因为 ITASCA 自己的弹窗是普通 `QWidget`，正文放在 label 里。
+
+它能碰到的是产品**闲着等**的弹窗——Qt 的嵌套事件循环在跑、Python 还在动，
+启动时问一句的就是这种。它碰不到从**引擎命令内部**弹出来的那种："Raise Dialog
+on Error" 会在整个 `exec()` 期间握着 GIL，任何线程都跑不了 Python，请求根本到不了。
+那种弹窗归 `utils/modal_guard`，也只有它能碰到——它自己写明了只在 bridge 正处在
+一条引擎命令里的时候轮询，而这里什么都还没有。两者不重叠。
 
 | 环境变量 | 默认 | |
 | :--- | :--- | :--- |

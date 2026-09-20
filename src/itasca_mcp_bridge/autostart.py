@@ -135,6 +135,19 @@ _reported_dialogs = set()
 # survives the click is reported rather than retried.
 _attempted_dismissals = set()
 
+# The last read of what is on screen, as plain data, plus the numbers handed
+# out to name each dialog by. Written on the GUI thread, read from request
+# threads: a list of dicts and ints crosses between them safely, a widget
+# does not.
+_dialogs = []
+_dialog_ids = {}
+
+# Answers posted by the HTTP side and not yet carried out, and the results
+# of the ones that were. The request thread waits on the result.
+_pending_answer = None
+_answer_seq = 0
+_answer_results = {}
+
 
 # ---- environment ------------------------------------------------------
 
@@ -331,30 +344,43 @@ def close_notice_windows():
     return closed
 
 
-def _button_labels(widget):
+def _buttons(widget):
     # type: (object) -> list
-    """Visible button labels, lowercased and stripped of ``&`` mnemonics."""
+    """The widget's visible buttons, in Qt's child order."""
     widgets = _qt_widgets()
     if widgets is None:
         return []
-    labels = []
+    found = []
     try:
         for button in widget.findChildren(widgets.QAbstractButton):
             try:
-                if not button.isVisible():
-                    continue
-                labels.append(button.text().replace("&", "").strip().lower())
+                if button.isVisible():
+                    found.append(button)
             except Exception:
                 continue
     except Exception:
         return []
-    return labels
+    return found
+
+
+def _button_text(button):
+    # type: (object) -> str
+    """A button's label as the product draws it, minus the ``&`` mnemonic."""
+    try:
+        return button.text().replace("&", "").strip()
+    except Exception:
+        return ""
+
+
+def _button_key(button):
+    # type: (object) -> str
+    return _button_text(button).lower()
 
 
 def _asks_nothing(widget):
     # type: (object) -> bool
     """Whether every visible button on this widget is an acknowledgement."""
-    labels = _button_labels(widget)
+    labels = [_button_key(button) for button in _buttons(widget)]
     return bool(labels) and all(label in ACKNOWLEDGE_BUTTONS for label in labels)
 
 
@@ -379,10 +405,6 @@ def dismiss_dialogs():
     widget, and holding a reference to a Qt widget in a set is how you get a
     reference that outlives the C++ object behind it.
     """
-    widgets = _qt_widgets()
-    if widgets is None:
-        return []
-
     dismissed = []
     for widget, title, is_dialog in _visible_windows():
         if not is_dialog or title.endswith(BENIGN_SUFFIX):
@@ -393,9 +415,8 @@ def dismiss_dialogs():
             continue
         _attempted_dismissals.add(title)
         try:
-            for button in widget.findChildren(widgets.QAbstractButton):
-                label = button.text().replace("&", "").strip().lower()
-                if button.isVisible() and label in ACKNOWLEDGE_BUTTONS:
+            for button in _buttons(widget):
+                if _button_key(button) in ACKNOWLEDGE_BUTTONS:
                     button.click()
                     break
             if not widget.isVisible():
@@ -403,6 +424,176 @@ def dismiss_dialogs():
         except Exception:
             continue
     return dismissed
+
+
+def _dialog_text(widget):
+    # type: (object) -> str
+    """Everything the box says, as one string.
+
+    A ``QMessageBox`` carries its body in ``text()``; the plain ``QWidget``
+    ITASCA uses for its own boxes carries it in child labels, which is why
+    both are read. Deduplicated because a message box's labels repeat its
+    ``text()``.
+    """
+    widgets = _qt_widgets()
+    if widgets is None:
+        return ""
+
+    parts = []
+    for name in ("text", "informativeText"):
+        getter = getattr(widget, name, None)
+        if callable(getter):
+            try:
+                parts.append(getter())
+            except Exception:
+                pass
+    try:
+        for label in widget.findChildren(widgets.QLabel):
+            try:
+                if label.isVisible():
+                    parts.append(label.text())
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    seen = []
+    for part in parts:
+        text = str(part or "").replace("\r\n", "\n").replace("\r", "\n")
+        text = text.replace("\u2029", "\n").strip()
+        if text and text not in seen:
+            seen.append(text)
+    return "\n".join(seen)
+
+
+def _dialog_id(title):
+    # type: (str) -> int
+    """A number that stays put for as long as this process lives.
+
+    The HTTP side needs to name a dialog it has only read about, and the
+    title is the only thing it shares with the GUI thread. Handing out an
+    integer instead keeps that sharing to strings and ints, so nothing on
+    the wire is a Qt object.
+    """
+    if title not in _dialog_ids:
+        _dialog_ids[title] = len(_dialog_ids) + 1
+    return _dialog_ids[title]
+
+
+def _describe_dialogs():
+    # type: () -> list
+    """Visible dialogs as plain data. GUI thread only."""
+    found = []
+    for widget, title, is_dialog in _visible_windows():
+        if not is_dialog or title.endswith(BENIGN_SUFFIX):
+            continue
+        buttons = _buttons(widget)
+        found.append(
+            {
+                "id": _dialog_id(title),
+                "title": title,
+                "text": _dialog_text(widget),
+                "buttons": [_button_text(button) for button in buttons],
+                "asks_nothing": _asks_nothing(widget),
+            }
+        )
+    return found
+
+
+def refresh_dialogs():
+    # type: () -> list
+    """Re-read the visible dialogs into the module-level snapshot.
+
+    Called on the GUI thread from the window watch. The snapshot is what the
+    HTTP side reads, and that is the whole point of it existing: a Qt widget
+    touched from a request thread is a crash with a delay on it, so widgets
+    are converted to strings here and never leave.
+    """
+    global _dialogs
+    _dialogs = _describe_dialogs()
+    return _dialogs
+
+
+def dialogs():
+    # type: () -> list
+    """The last snapshot. Callable from any thread -- it is only data."""
+    return _dialogs
+
+
+def _answer(dialog_id, key):
+    # type: (int, str) -> dict
+    """Click a button on a dialog. GUI thread only. Returns a result dict."""
+    for widget, title, is_dialog in _visible_windows():
+        if not is_dialog or _dialog_id(title) != dialog_id:
+            continue
+        _attempted_dismissals.add(title)
+        for button in _buttons(widget):
+            if _button_key(button) == key:
+                button.click()
+                break
+        else:
+            return {"status": "error", "message": "that dialog has no '{}' button".format(key)}
+        # Re-read rather than trust the click: Qt lets a widget survive one.
+        if widget.isVisible():
+            return {"status": "error", "message": "the product did not act on '{}'".format(key)}
+        return {"status": "success", "message": "answered '{}' on '{}'".format(key, title)}
+    return {"status": "error", "message": "that dialog is not on screen any more"}
+
+
+def answer_dialog(dialog_id, label, timeout=5.0):
+    # type: (int, str, float) -> dict
+    """Ask the GUI thread to click a button. Safe from any thread.
+
+    The click itself has to happen on the GUI thread, so this posts the
+    request and waits for the window watch to carry it out -- the same hop
+    :func:`boot` makes, without a second queued object, because the watch is
+    already there and already on the right thread.
+
+    Waiting is what makes the answer honest. A queued request with nothing
+    draining the queue is indistinguishable from one that worked, which is
+    precisely the failure this module exists to avoid, so a request nobody
+    picks up inside ``timeout`` is withdrawn and reported as such.
+    """
+    global _pending_answer, _answer_seq
+
+    if _qt_widgets() is None:
+        return {"status": "error", "message": "this process has no Qt to drive"}
+    if _pending_answer is not None:
+        return {"status": "error", "message": "another answer is already in flight"}
+
+    _answer_seq += 1
+    token = _answer_seq
+    _pending_answer = (token, dialog_id, str(label).strip().lower())
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = _answer_results.pop(token, None)
+        if result is not None:
+            return result
+        time.sleep(0.05)
+
+    if _pending_answer is not None and _pending_answer[0] == token:
+        _pending_answer = None
+    return {
+        "status": "error",
+        "message": (
+            "nothing carried the answer out within {:.0f}s; the window watch "
+            "is not running in this process".format(timeout)
+        ),
+    }
+
+
+def _carry_out_answer():
+    # type: () -> None
+    """Perform the answer the HTTP side posted, if there is one. GUI thread."""
+    global _pending_answer
+
+    pending = _pending_answer
+    if pending is None:
+        return
+    _pending_answer = None
+    token, dialog_id, key = pending
+    _answer_results[token] = _answer(dialog_id, key)
 
 
 def waiting_dialogs():
@@ -477,6 +668,14 @@ def _schedule_window_watch(interval_ms=1000):
 
 def _tick_windows():
     # type: () -> None
+    # An answer the HTTP side posted goes first, so a box the agent has
+    # already ruled on is not also swept out from under it.
+    _carry_out_answer()
+
+    # Then the snapshot the HTTP side reads, so /dialogs is never a tick
+    # behind the box that was just answered.
+    refresh_dialogs()
+
     if _env_flag(ENV_DISMISS_WINDOWS, False):
         for title in close_notice_windows():
             _log("closed the product's notice window: {}".format(title))

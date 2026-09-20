@@ -73,6 +73,12 @@ commands are product-neutral:
 | `list_tasks` | List known tasks | `offset`, `limit` |
 | `interrupt_task` | Request a graceful interrupt of a running task | `task_id` |
 | `execute_code` | Run a snippet in the running task's `__main__` (sync REPL) | `code`, `timeout_ms` |
+| `list_dialogs` | What the product is asking, with the buttons it is asking it with | — |
+| `answer_dialog` | Click one of those buttons | `id`, `button` |
+
+`GET /dialogs` is the same payload as `list_dialogs` for a client that only
+speaks curl. See [Start with the product](#start-with-the-product) for what
+these are for.
 
 ## Quick Start
 
@@ -152,6 +158,49 @@ Which is why a notice is *closed* and a no-choice dialog is *answered*. On
 PFC2D 7.00.161 the first answer produced two more, so this is a sweep rather
 than a click; the last of the three was an `Ok`-only box reporting an
 unrepeatable model state, which blocks the product and offers no way past.
+
+That switch is the hook's own policy, and a policy written down in advance
+cannot cover a box nobody has seen yet — which is exactly the position of
+anyone whose only copy of the product is the one they have. So the same
+watch also publishes what it sees, and lets a client answer instead:
+
+```console
+$ curl -s localhost:9001/dialogs
+{"status": "success", "data": {"dialogs": [
+  {"id": 1, "title": "Recover Project File",
+   "text": "The project file was not saved...",
+   "buttons": ["Open", "Discard"], "asks_nothing": false}]}}
+
+$ curl -s -X POST localhost:9001/answer_dialog \
+    -d '{"request_id":"1","id":1,"button":"Open"}'
+```
+
+The snapshot is read off the widgets by the GUI thread and arrives as
+strings: a title, the box's body text, and the labels on its buttons. A
+client reads that, decides, and posts back an id and a label taken from it.
+The id is handed out once per title and stays put, and the label is matched
+against the buttons actually on the dialog, so an id that has since been
+reused cannot click whatever moved underneath it.
+
+Nothing about this is automatic. The click happens on the GUI thread, on the
+next pass of the watch — the same hop `start()` needs, without a second
+queued object, because the watch is already there and already on the right
+thread. The request waits for that pass to report back and **withdraws
+itself** if nothing picks it up, rather than returning success into an empty
+room: a queued call with nothing on the other end is the failure this whole
+module exists to avoid. If the product is a console build, or the bridge was
+started by hand from the console, there is no watch and the answer says so.
+Bodies are read from `QMessageBox.text()` and from child labels, because
+ITASCA's own boxes are plain `QWidget`s and keep theirs in labels.
+
+What this reaches is a box the product is *idle* on — Qt's nested event loop
+is running and Python is still moving, which is what a startup question is.
+It cannot reach a box raised from **inside** an engine command: "Raise Dialog
+on Error" holds the GIL for the whole of `exec()`, so no Python runs on any
+thread and the request does not even arrive. That box belongs to
+`utils/modal_guard`, which is the only thing that can reach it and says so
+itself — it polls only while the bridge is inside an engine command, and by
+definition nothing here is yet. The two do not overlap.
 
 | Variable | Default | |
 | :--- | :--- | :--- |

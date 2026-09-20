@@ -11,6 +11,8 @@ belongs to somebody else.
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 import pytest
 from itasca_mcp_bridge import autostart
@@ -146,12 +148,27 @@ class _FakeButton:
             self._owner._visible = False
 
 
+class _FakeLabel:
+    """A child label. This is where a plain `QWidget` keeps its body text."""
+
+    def __init__(self, text, visible=True):
+        self._text = text
+        self._visible = visible
+
+    def text(self):
+        return self._text
+
+    def isVisible(self):
+        return self._visible
+
+
 class _FakeWidget:
-    def __init__(self, title, visible=True, refuses=False, buttons=()):
+    def __init__(self, title, visible=True, refuses=False, buttons=(), labels=()):
         self._title = title
         self._visible = visible
         self._refuses = refuses
         self.buttons = list(buttons)
+        self.labels = list(labels)
         self.closes = 0
 
     def windowTitle(self):
@@ -166,15 +183,30 @@ class _FakeWidget:
             self._visible = False
 
     def findChildren(self, kind):
-        return list(self.buttons) if kind is _FakeButton else []
+        if kind is _FakeButton:
+            return list(self.buttons)
+        if kind is _FakeLabel:
+            return list(self.labels)
+        return []
 
 
 class _FakeDialog(_FakeWidget):
     """A widget that asks something. `QDialog` is the hook's only test for it."""
 
 
+class _FakeMessageBox(_FakeDialog):
+    """A dialog that carries its body in `text()`, the way `QMessageBox` does."""
+
+    def __init__(self, title, body, **kwargs):
+        _FakeDialog.__init__(self, title, **kwargs)
+        self._body = body
+
+    def text(self):
+        return self._body
+
+
 def _dialog(title, *labels, **kwargs):
-    """A dialog carrying buttons, so `dismissible` has something to read."""
+    """A dialog carrying buttons, so the sweep has something to read."""
     dialog = _FakeDialog(title, **kwargs)
     dialog.buttons = [_FakeButton(label, dialog) for label in labels]
     return dialog
@@ -191,6 +223,7 @@ class _FakeApplication:
 class _FakeWidgets:
     QDialog = _FakeDialog
     QAbstractButton = _FakeButton
+    QLabel = _FakeLabel
     QApplication = None
 
     def __init__(self, widgets):
@@ -201,6 +234,10 @@ def _with_widgets(monkeypatch, widgets):
     monkeypatch.setattr(autostart, "_qt_widgets", lambda: _FakeWidgets(widgets))
     monkeypatch.setattr(autostart, "_reported_dialogs", set())
     monkeypatch.setattr(autostart, "_attempted_dismissals", set())
+    monkeypatch.setattr(autostart, "_dialogs", [])
+    monkeypatch.setattr(autostart, "_dialog_ids", {})
+    monkeypatch.setattr(autostart, "_pending_answer", None)
+    monkeypatch.setattr(autostart, "_answer_results", {})
 
 
 def test_closes_only_the_revision_notice(monkeypatch):
@@ -283,7 +320,11 @@ def test_hidden_dialogs_are_not_waiting(monkeypatch):
 
 
 def _log_of(tmp_path):
-    return (tmp_path / "autostart.log").read_text()
+    # "" when nothing was ever written, which is a real outcome and not a
+    # missing fixture: the log file is created by the first line that goes
+    # into it, so "no file" and "no lines" are the same statement.
+    path = tmp_path / "autostart.log"
+    return path.read_text() if path.exists() else ""
 
 
 def test_a_waiting_dialog_is_logged_once_not_once_a_second(monkeypatch, tmp_path):
@@ -450,6 +491,227 @@ def test_answering_is_opt_in_and_off_by_default(monkeypatch, tmp_path):
 
     assert dialog.buttons[0].clicks == 0
     assert "PFC2D 7.00" in _log_of(tmp_path)
+
+
+# ---- what the product is asking, for a client that wants to decide ----
+
+# The bridge's own policy is narrow on purpose: it answers a box that asks
+# nothing and leaves every real choice alone. That policy needs a client to
+# be optional rather than required, which is what these cover -- a snapshot
+# of what is on screen, and a way to click a named button on it.
+
+
+def test_the_snapshot_carries_what_a_client_needs_to_decide(monkeypatch):
+    box = _FakeMessageBox(
+        "PFC2D 7.00", "Model state is currently marked as unrepeatable.",
+        labels=[_FakeLabel("Cycle 0")],
+    )
+    box.buttons = [_FakeButton("Ok", box)]
+    _with_widgets(monkeypatch, [box])
+
+    assert autostart.refresh_dialogs() == [
+        {
+            "id": 1,
+            "title": "PFC2D 7.00",
+            "text": "Model state is currently marked as unrepeatable.\nCycle 0",
+            "buttons": ["Ok"],
+            "asks_nothing": True,
+        }
+    ]
+
+
+def test_a_dialogs_body_is_read_from_labels_when_it_has_no_text(monkeypatch):
+    # The third box on PFC2D 7.00.161 is a plain QWidget, not a QMessageBox,
+    # and it keeps its body in child labels. A snapshot that only knew about
+    # text() would hand the client an empty string and no way to decide.
+    box = _FakeDialog("PFC2D 7.00", labels=[_FakeLabel("unrepeatable")])
+    box.buttons = [_FakeButton("Ok", box)]
+    _with_widgets(monkeypatch, [box])
+
+    assert autostart.refresh_dialogs()[0]["text"] == "unrepeatable"
+
+
+def test_a_label_hidden_from_the_reader_is_hidden_from_the_client(monkeypatch):
+    box = _FakeDialog("PFC2D 7.00", labels=[_FakeLabel("shown"), _FakeLabel("gone", visible=False)])
+    box.buttons = [_FakeButton("Ok", box)]
+    _with_widgets(monkeypatch, [box])
+
+    assert autostart.refresh_dialogs()[0]["text"] == "shown"
+
+
+def test_the_snapshot_leaves_out_windows_that_ask_nothing_of_anyone(monkeypatch):
+    # An empty `dialogs` list is how a client learns the product is free.
+    # Filling it with document windows and the revision notice would make
+    # that question unanswerable.
+    document = _FakeWidget("Model - PFC2D 7.00.161")
+    notice = _dialog("PFC2D 7.00.161 : Startup", "Ok")
+    _with_widgets(monkeypatch, [document, notice, _dialog("Recover Project File", "Open", "Discard")])
+
+    assert [d["title"] for d in autostart.refresh_dialogs()] == ["Recover Project File"]
+
+
+def test_an_id_stays_put_while_the_dialog_does(monkeypatch):
+    # A client reads an id, thinks about it, and posts it back. Renumbering
+    # between the two would have it answer whatever moved into that slot.
+    box = _dialog("Recover Project File", "Open", "Discard")
+    _with_widgets(monkeypatch, [box])
+
+    assert autostart.refresh_dialogs()[0]["id"] == autostart.refresh_dialogs()[0]["id"]
+    assert autostart.dialogs()[0]["id"] == 1
+
+
+def test_the_snapshot_goes_stale_until_the_watch_refreshes_it(monkeypatch, tmp_path):
+    # `dialogs()` is a read of the last snapshot, not a fresh look: it is
+    # called from a request thread, and looking would mean touching widgets
+    # from one.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("PFC2D 7.00", "Ok")
+    _with_widgets(monkeypatch, [box])
+
+    assert autostart.dialogs() == []
+    autostart._tick_windows()
+    assert [d["title"] for d in autostart.dialogs()] == ["PFC2D 7.00"]
+
+
+def _post_and_drain(dialog_id, label, timeout=5.0):
+    """Answer as a request thread does, with the test thread as the watch."""
+    out = {}
+
+    def _post():
+        out["result"] = autostart.answer_dialog(dialog_id, label, timeout=timeout)
+
+    thread = threading.Thread(target=_post)
+    thread.start()
+    for _ in range(400):
+        if autostart._pending_answer is not None:
+            break
+        time.sleep(0.005)
+    autostart._tick_windows()
+    thread.join(5.0)
+    return out.get("result"), thread
+
+
+def test_a_client_can_answer_a_dialog_the_hook_would_leave_alone(monkeypatch, tmp_path):
+    # The policy is the hook's, not the bridge's. Nothing refuses this one.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("Recover Project File", "Open", "Discard")
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+
+    result, thread = _post_and_drain(1, "Open")
+
+    assert thread.is_alive() is False
+    assert result["status"] == "success"
+    assert box.buttons[0].clicks == 1
+    assert box.buttons[1].clicks == 0
+
+
+def test_the_answer_is_carried_out_on_the_watch_and_clicked_once(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("PFC2D 7.00", "Ok")
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+
+    _post_and_drain(1, "Ok")
+    autostart._tick_windows()
+    autostart._tick_windows()
+
+    assert box.buttons[0].clicks == 1
+
+
+def test_a_button_the_dialog_does_not_have_is_refused(monkeypatch, tmp_path):
+    # Matching against the buttons actually present is what stops an id that
+    # has been reused from clicking whatever is now under it.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("Recover Project File", "Open", "Discard")
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+
+    result, _ = _post_and_drain(1, "Delete Everything")
+
+    assert result["status"] == "error"
+    assert "no 'delete everything' button" in result["message"]
+    assert box.buttons[0].clicks == 0
+    assert box.buttons[1].clicks == 0
+
+
+def test_answering_a_dialog_that_is_gone_is_an_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("Recover Project File", "Open", "Discard")
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+    box._visible = False
+
+    result, _ = _post_and_drain(1, "Open")
+
+    assert result["status"] == "error"
+    assert box.buttons[0].clicks == 0
+
+
+def test_a_click_the_product_ignores_is_not_reported_as_an_answer(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("PFC2D 7.00", "Ok")
+    box.buttons[0]._dismisses = False
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+
+    result, _ = _post_and_drain(1, "Ok")
+
+    assert result["status"] == "error"
+    assert "did not act" in result["message"]
+
+
+def test_an_answer_nobody_drains_is_withdrawn_and_reported(monkeypatch):
+    # The failure this whole module is about: a queued call with nothing on
+    # the other end looks exactly like one that worked. Here it must not.
+    _with_widgets(monkeypatch, [_dialog("PFC2D 7.00", "Ok")])
+
+    result = autostart.answer_dialog(1, "Ok", timeout=0.2)
+
+    assert result["status"] == "error"
+    assert "not running in this process" in result["message"]
+    assert autostart._pending_answer is None
+
+
+def test_two_answers_at_once_are_refused_rather_than_raced(monkeypatch):
+    _with_widgets(monkeypatch, [_dialog("PFC2D 7.00", "Ok")])
+    monkeypatch.setattr(autostart, "_pending_answer", (99, 1, "ok"))
+
+    result = autostart.answer_dialog(1, "Ok", timeout=0.2)
+
+    assert result["status"] == "error"
+    assert "already in flight" in result["message"]
+    # And the one that was already posted is left where it was.
+    assert autostart._pending_answer == (99, 1, "ok")
+
+
+def test_the_label_matches_however_the_client_cases_it(monkeypatch, tmp_path):
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("PFC2D 7.00", "Ok")
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+
+    result, _ = _post_and_drain(1, "  oK  ")
+
+    assert result["status"] == "success"
+    assert box.buttons[0].clicks == 1
+
+
+def test_an_answered_dialog_is_not_swept_again_by_the_policy(monkeypatch, tmp_path):
+    # The client's answer lands first; the automatic pass then finds the box
+    # already accounted for and does not click a second time.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    monkeypatch.setenv(autostart.ENV_DISMISS_WINDOWS, "1")
+    box = _dialog("PFC2D 7.00", "Ok")
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+
+    _post_and_drain(1, "Ok")
+    autostart._tick_windows()
+    autostart._tick_windows()
+
+    assert box.buttons[0].clicks == 1
+    assert "dismissed a dialog that asks nothing" not in _log_of(tmp_path)
 
 
 # ---- installing the shim ----------------------------------------------
