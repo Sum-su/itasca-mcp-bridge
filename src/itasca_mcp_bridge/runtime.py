@@ -106,6 +106,90 @@ def _qt_event_loop_running(QtCore):
         return False
 
 
+def _on_application_thread(QtCore, app):
+    # type: (...) -> bool
+    """Whether the caller is running on the thread that owns `app`.
+
+    A QTimer belongs to the thread that constructs it and is delivered only
+    by that thread's event loop, so the task pump has to be installed on the
+    one thread Qt already runs a loop on -- the application's. Installed
+    anywhere else, the timer is created into a thread with no loop to
+    deliver it; when that thread exits, the process goes with it.
+
+    Neither witness in `_start_qt_pump` can see this. `_is_qt_gui_app`
+    describes the application object rather than the caller, so it answers
+    the same in every thread. `_qt_event_loop_running` reads the *caller's*
+    loop level, which is 0 on a worker thread and equally 0 on the
+    application thread before `exec()` -- the case the `or` exists to keep
+    working, so it cannot be made mandatory.
+
+    Identity first, equality second: `is` is what a binding that keeps one
+    wrapper per QThread gives us, `==` what a binding with pointer
+    comparison gives. Measured on PySide2 5.11 (PFC 7.0) both read True on
+    the application thread and False on a plain `threading.Thread`, so
+    either alone would do there; the pair is for the bindings this was not
+    measured on. `QThread.currentThreadId()` is not an option -- PySide2
+    5.11 does not expose it.
+    """
+    try:
+        current = QtCore.QThread.currentThread()
+        owner = app.thread()
+    except Exception:
+        return False
+    if current is owner:
+        return True
+    try:
+        return bool(current == owner)
+    except Exception:
+        return False
+
+
+def _require_application_thread(QtCore, app, logger):
+    # type: (...) -> None
+    """Raise unless the caller is running on the thread that owns `app`."""
+    if _on_application_thread(QtCore, app):
+        return
+    import threading
+
+    message = (
+        "start() must run on the Qt application's thread: the task pump is "
+        "a QTimer, and a QTimer only ticks on the thread that owns it. "
+        "Called from thread '{}', which does not own the application. "
+        "Starting here would bind the port and keep answering /health "
+        "while nothing is ever pumped, and then take the process down "
+        "when this thread exits."
+    ).format(threading.current_thread().name)
+    logger.error(message)
+    raise RuntimeError(message)
+
+
+def _preflight_qt_pump_thread(mode, logger):
+    # type: (...) -> None
+    """Refuse an off-thread Qt pump before `start()` touches anything.
+
+    The invariant belongs in `_start_qt_pump`, and it is enforced there
+    too -- but that call comes after the engine configuration and after
+    `create_server()`, so raising only there leaves an HTTP server bound to
+    the requested port with no pump behind it: `/health` answering 200
+    while every task times out (issue #165). Measured with the guard in
+    that position only -- port 9002 stayed LISTENING, answered /health, and
+    timed out a `1+1` for as long as the process lived.
+
+    Silent unless it is going to raise, and it reaches no verdict on a
+    console host: there is no application to be off the thread of, and the
+    blocking pump is the caller's to hold.
+    """
+    if mode not in ("auto", "gui"):
+        return
+    QtCore = _import_qtcore()
+    if QtCore is None:
+        return
+    app = QtCore.QCoreApplication.instance()
+    if not _is_qt_gui_app(app):
+        return
+    _require_application_thread(QtCore, app, logger)
+
+
 def _start_qt_pump(main_executor, interval_ms, max_tasks_per_tick, logger):
     # type: (...) -> bool
     """Try to attach task processing to Qt event loop. Returns True on success."""
@@ -121,6 +205,16 @@ def _start_qt_pump(main_executor, interval_ms, max_tasks_per_tick, logger):
             "No Qt GUI application and no running event loop; Qt timer pump unavailable"
         )
         return False
+
+    # The gate above reads the application and the caller's loop level, never
+    # which thread the caller is on, so a worker thread passes it too. Refuse
+    # rather than fall back: the fallback is the blocking pump, which would
+    # drive the engine's tasks from this thread instead of the product's --
+    # the same mistake wearing the other pump. Measured on PFC2D 7.00.161 GUI
+    # (3/3) before this check existed: the port bound and answered, then both
+    # ports went silent at +6s, then the process was gone at +15s with no
+    # crash entry and no unsaved-model prompt. See issue #166.
+    _require_application_thread(QtCore, app, logger)
 
     # Stop previous timer if start() is called multiple times.
     if _qt_task_timer is not None:
@@ -196,6 +290,14 @@ def start(
         raise ValueError(
             "Invalid mode '{}'. Expected one of: {}".format(mode, ", ".join(VALID_RUNTIME_MODES))
         )
+
+    # Deliberately above the logging setup, the engine callbacks and the
+    # port: a refusal has to leave the process as it found it, and this is
+    # the cheapest of the three to have happen first. The price is that the
+    # error line goes to whatever the host has configured rather than to
+    # bridge.log, which does not exist yet -- the exception carries the same
+    # message to the caller either way.
+    _preflight_qt_pump_thread(mode, logging.getLogger("itasca-mcp-bridge"))
 
     # Pump cadence and per-tick task budget are bridge implementation details,
     # not start() knobs (mirrors yade-mcp). Sourced from the module constants.
