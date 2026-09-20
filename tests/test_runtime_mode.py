@@ -44,6 +44,21 @@ class _FakeTimer:
         self.started = False
 
 
+class _FakeThread:
+    """One thread, as Qt sees it: a QThread wrapper carrying a loop level.
+
+    A single object stands in for `QThread.currentThread()` and for the
+    application's own thread, so `is` and `==` agree -- which is what the
+    measured PySide2 5.11 behaviour does. See `runtime._on_application_thread`.
+    """
+
+    def __init__(self, loop_level):
+        self._loop_level = loop_level
+
+    def loopLevel(self):  # noqa: N802 - Qt spelling
+        return self._loop_level
+
+
 class _FakeMetaObject:
     """One link of a C++ QMetaObject superclass chain."""
 
@@ -77,10 +92,20 @@ class _FakeApp:
 
     def __init__(self, meta_names, python_type_name):
         self._meta = _meta_chain(meta_names)
-        self.__class__ = type(python_type_name, (_FakeApp,), {})
+        # The thread that owns the application; wired up by _install_binding,
+        # which is what a real binding reads `app.thread()` out of.
+        self._qt_thread = None
+        # Derived from `self.__class__`, not from `_FakeApp`: a subclass that
+        # overrides a method (the hostile metaobject, the threadless binding)
+        # has to stay in the MRO, or the override is never reached and the
+        # test passes without exercising what it names.
+        self.__class__ = type(python_type_name, (self.__class__,), {})
 
     def metaObject(self):  # noqa: N802 - Qt spelling
         return self._meta
+
+    def thread(self):  # noqa: N802 - Qt spelling
+        return self._qt_thread
 
 
 _QOBJECT_TAIL = ["QApplication", "QGuiApplication", "QCoreApplication", "QObject"]
@@ -106,8 +131,17 @@ _HOSTS = {
 }
 
 
-def _install_binding(monkeypatch, binding, app, loop_level=0):
-    """Register a fake PySide binding exposing `app` and a thread loop level."""
+def _install_binding(monkeypatch, binding, app, loop_level=0, caller_thread=None):
+    """Register a fake PySide binding exposing `app` and a thread loop level.
+
+    `loop_level` belongs to the thread that owns `app`, and the caller is on
+    that same thread unless `caller_thread` names another one. The two are
+    the same object when they match, because that is what the binding does:
+    `QThread.currentThread()` hands back the wrapper that owns the
+    application. See `runtime._on_application_thread`.
+    """
+    app_thread = _FakeThread(loop_level)
+    caller = app_thread if caller_thread is None else caller_thread
 
     class _QCoreApplication:
         @staticmethod
@@ -117,7 +151,7 @@ def _install_binding(monkeypatch, binding, app, loop_level=0):
     class _QThread:
         @staticmethod
         def currentThread():  # noqa: N802 - Qt spelling
-            return types.SimpleNamespace(loopLevel=lambda: loop_level)
+            return caller
 
     qtcore = types.ModuleType(binding + ".QtCore")
     qtcore.QCoreApplication = _QCoreApplication
@@ -129,6 +163,8 @@ def _install_binding(monkeypatch, binding, app, loop_level=0):
 
     monkeypatch.setitem(sys.modules, binding, package)
     monkeypatch.setitem(sys.modules, binding + ".QtCore", qtcore)
+    if app is not None:
+        app._qt_thread = app_thread
     return qtcore
 
 
@@ -238,14 +274,18 @@ def test_no_qt_binding_falls_back():
 def test_broken_metaobject_still_consults_the_event_loop(monkeypatch):
     """A witness that raises must not be read as a negative answer."""
 
+    reached = []
+
     class _Hostile(_FakeApp):
         def metaObject(self):  # noqa: N802 - Qt spelling
+            reached.append(1)
             raise RuntimeError("no metaobject for you")
 
     app = _Hostile(["QApplication", "QObject"], "QCoreApplication")
     _install_binding(monkeypatch, "PySide6", app, loop_level=1)
 
     assert _start() is True
+    assert reached, "fixture must reach the raising witness, not the base one"
 
 
 @pytest.mark.usefixtures("_no_real_bindings")
@@ -272,3 +312,136 @@ def test_gate_reads_only_qtcore(monkeypatch):
 
     assert _start() is True, "detection broke on a binding whose extras fail to import"
     assert reached == []
+
+
+# --- Thread affinity -------------------------------------------------------
+#
+# The two witnesses above describe the application and the caller's loop
+# level, never which thread the caller is on, so a worker thread satisfies
+# both. Issue #166: installing the pump there binds the port, stops
+# answering, and then takes the process with it.
+
+
+def _host_on_another_thread(monkeypatch, host="pfc97_gui", caller_loop_level=0):
+    """A GUI application owned by a thread the caller is not on."""
+    meta_names, python_type_name, loop_level = _HOSTS[host]
+    app = _FakeApp(meta_names, python_type_name)
+    _install_binding(
+        monkeypatch,
+        "PySide6",
+        app,
+        loop_level=loop_level,
+        caller_thread=_FakeThread(caller_loop_level),
+    )
+    return app
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_off_thread_call_is_refused(monkeypatch):
+    """PFC 7.0 GUI, `start()` from a worker: measured 3/3 to kill the process.
+
+    Timeline from the issue: +3s the new port binds and answers, +6s both
+    ports stop answering with the socket still LISTENING, +15s the process is
+    gone with no `Application Error` entry -- an exit, not a crash, so the
+    session and any unsaved model go with it silently. `start()` never
+    returned to its caller.
+    """
+    _host_on_another_thread(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="thread that owns it"):
+        _start()
+    assert runtime._qt_task_timer is None
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_a_live_loop_on_the_wrong_thread_is_still_refused(monkeypatch):
+    """A loop here is not enough when the application is elsewhere.
+
+    The timer would tick -- but `_process_tick` would then drive the engine
+    from a thread that is not the product's, which is the contract the pump
+    exists to keep. Refusing is the only outcome that is wrong in neither
+    direction.
+    """
+    _host_on_another_thread(monkeypatch, caller_loop_level=1)
+
+    with pytest.raises(RuntimeError, match="thread that owns it"):
+        _start()
+    assert runtime._qt_task_timer is None
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_refused_call_does_not_stop_a_running_pump(monkeypatch):
+    """The refusal happens before the previous timer is touched.
+
+    A worker calling `start()` on a *working* bridge must not take the
+    existing pump down on its way to raising.
+    """
+    app = _host_on_another_thread(monkeypatch)
+    existing = _FakeTimer()
+    existing.started = True
+    monkeypatch.setattr(runtime, "_qt_task_timer", existing, raising=False)
+
+    with pytest.raises(RuntimeError):
+        _start()
+
+    assert existing.started is True
+    assert runtime._qt_task_timer is existing
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_preflight_refuses_before_start_touches_anything(monkeypatch):
+    """`start()` must reject an off-thread Qt pump before it mutates state.
+
+    Guarding only inside `_start_qt_pump` comes too late: that call sits
+    after `create_server()`, so the refusal fell out with the requested port
+    already bound and no pump behind it -- `/health` answering 200 while
+    every task times out, which is issue #165 again. Measured: port 9002
+    stayed LISTENING and timed out a `1+1` for the life of the process.
+    """
+    _host_on_another_thread(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="thread that owns it"):
+        runtime._preflight_qt_pump_thread("auto", MagicMock(name="logger"))
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_preflight_is_silent_on_a_console_host(monkeypatch):
+    """Nothing to be off the thread of, and the blocking pump is the
+    caller's to hold -- that is the headless launcher's whole shape."""
+    _install_host(monkeypatch, "PySide6", "pfc97_console")
+
+    runtime._preflight_qt_pump_thread("auto", MagicMock(name="logger"))
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_preflight_is_silent_for_console_mode(monkeypatch):
+    """`mode="console"` never installs a QTimer, so the thread cannot matter."""
+    _host_on_another_thread(monkeypatch)
+
+    runtime._preflight_qt_pump_thread("console", MagicMock(name="logger"))
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_preflight_is_silent_without_a_qt_binding():
+    runtime._preflight_qt_pump_thread("auto", MagicMock(name="logger"))
+
+
+@pytest.mark.usefixtures("_no_real_bindings")
+def test_missing_thread_method_is_refused_not_assumed(monkeypatch):
+    """An application that cannot name its thread is not taken on trust.
+
+    Unverifiable is not the same as fine: this is the branch that decides
+    between a working bridge and a process that exits without a word.
+    """
+
+    class _Threadless(_FakeApp):
+        def thread(self):  # noqa: N802 - Qt spelling
+            raise RuntimeError("this binding exposes no QObject.thread()")
+
+    meta_names, _, _ = _HOSTS["pfc97_gui"]
+    app = _Threadless(meta_names, "QApplication")
+    _install_binding(monkeypatch, "PySide6", app, loop_level=0)
+
+    with pytest.raises(RuntimeError, match="thread that owns it"):
+        _start()
+    assert runtime._qt_task_timer is None
