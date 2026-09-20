@@ -522,22 +522,47 @@ def dialogs():
 
 def _answer(dialog_id, key):
     # type: (int, str) -> dict
-    """Click a button on a dialog. GUI thread only. Returns a result dict."""
+    """Click a button on a dialog. GUI thread only. Returns a result dict.
+
+    Reports the button label the product draws, not the key the caller sent.
+    The two differ in case, and echoing the caller's own input back reads as
+    though the product had renamed the button.
+    """
+    known = sorted(set(_dialog_ids.values()))
     for widget, title, is_dialog in _visible_windows():
         if not is_dialog or _dialog_id(title) != dialog_id:
             continue
         _attempted_dismissals.add(title)
         for button in _buttons(widget):
             if _button_key(button) == key:
+                label = _button_text(button)
                 button.click()
                 break
         else:
-            return {"status": "error", "message": "that dialog has no '{}' button".format(key)}
+            return {
+                "status": "error",
+                "message": "dialog {} has no '{}' button; it offers {}".format(
+                    dialog_id, key, [_button_text(b) for b in _buttons(widget)]
+                ),
+            }
         # Re-read rather than trust the click: Qt lets a widget survive one.
         if widget.isVisible():
-            return {"status": "error", "message": "the product did not act on '{}'".format(key)}
-        return {"status": "success", "message": "answered '{}' on '{}'".format(key, title)}
-    return {"status": "error", "message": "that dialog is not on screen any more"}
+            return {"status": "error", "message": "the product did not act on '{}'".format(label)}
+        return {"status": "success", "message": "answered '{}' on '{}'".format(label, title)}
+    if dialog_id in known:
+        return {
+            "status": "error",
+            "message": "the dialog with id {} is not on screen any more".format(dialog_id),
+        }
+    # Never issued: distinguish it from one that has gone, because "not on
+    # screen any more" for an id that never existed sends the caller looking
+    # for a dialog that was never there.
+    return {
+        "status": "error",
+        "message": "there is no dialog with id {}; the watch has seen {}".format(
+            dialog_id, known or "none"
+        ),
+    }
 
 
 def answer_dialog(dialog_id, label, timeout=5.0):
@@ -610,17 +635,21 @@ def waiting_dialogs():
     engine command sits outside ``modal_guard``'s reach -- that only runs
     while the bridge is inside an engine command, and by definition nothing
     is -- so an unattended start that ends at a box nobody can see is a
-    product that looks started and does nothing. Measured on PFC2D 7.00.161:
-    with the recovery prompt up, ``plot export bitmap`` succeeds and writes
-    nothing at all, which is indistinguishable from a plot with nothing in
-    it. Bitmap export is how an agent sees, so this is the difference between
-    a wrong picture and no picture.
+    product that looks started and does nothing.
 
-    What it is *not* is a hung bridge: a Qt modal runs a nested event loop
-    and the task pump keeps ticking inside it (measured -- ``1+1`` still
-    round-trips with the box up). Native message boxes are the ones that
-    freeze the thread, and those are not ``QDialog``, so they never reach
-    this function.
+    Everything the box does *not* break is why it has to be said out loud.
+    Measured on PFC2D 7.00.161: a Qt modal runs a nested event loop, so the
+    pump keeps ticking and ``1+1`` still round-trips with the box up; and
+    ``plot export bitmap`` is unaffected by it -- a QMessageBox with two
+    buttons held open across an export produced a file byte-identical to the
+    one exported with no box on screen (43359 bytes, same sha256, 197 balls
+    in the plot). So the failure is not a wrong picture or a hung request.
+    It is silence, and a box nobody answers keeps coming back to the front of
+    the screen it is standing on.
+
+    Native (non-``QDialog``) message boxes are the ones that would freeze
+    the thread, and those never reach this function. None has been observed
+    on 7.00.161; see the module docstring.
     """
     return [
         title
@@ -694,12 +723,13 @@ def _tick_windows():
         if title in _reported_dialogs:
             continue
         _reported_dialogs.add(title)
-        # Not "tasks will hang": a Qt modal runs a nested event loop and the
-        # pump keeps ticking inside it, measured. What it does silently break
-        # is bitmap export -- see waiting_dialogs().
+        # Neither "tasks will hang" nor "plot exports write nothing": both
+        # were measured false -- see waiting_dialogs(). What is left to say is
+        # the part that makes it worth logging at all, which is that nothing
+        # else will report it and it will not clear on its own.
         _log(
             "a dialog is waiting for a human, leaving it alone: {}"
-            "  (the product is blocked on it, and plot exports write nothing)"
+            "  (nothing else reports it; GET /dialogs lists its buttons)"
             .format(title)
         )
 

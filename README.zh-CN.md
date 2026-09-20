@@ -119,12 +119,14 @@ $ python -m itasca_mcp_bridge autostart remove
 ——不管有没有被允许去关。第一条引擎命令之前冒出来的弹窗在 `utils/modal_guard`
 的视野之外（那个只在 bridge 正处在一条引擎命令里的时候才轮询，而这里什么都还没有）。
 它**不会**吊死 bridge：Qt 模态弹窗跑的是嵌套事件循环，任务泵在里面照常 tick
-（实测——弹窗挂着时任务仍然往返成功）。它静默弄坏的是 `plot export bitmap`：
-命令报成功，**什么都不写**，和"这个 plot 本来就是空的"完全分不出来。对 agent 来说，
-位图导出就是眼睛，所以这是"错的图"和"没有图"之间的差别。日志里那一行是唯一的症状：
+（实测——弹窗挂着时任务仍然往返成功）。它也**不会**弄坏返回的东西：把一个两按钮的
+`QMessageBox` 全程架在一次 `plot export bitmap` 上，导出的文件和"屏幕上根本没有弹窗"
+时导出的那份**逐字节相同**（43359 字节，sha256 一致，plot 里有 197 个球）。
+剩下的就是**沉默**——什么都不报错，所以除了这一行日志没有任何东西会告诉你它在那儿，
+而没人回答的弹窗会一直往屏幕最前面翻。日志里那一行是唯一的症状：
 
 ```text
-a dialog is waiting for a human, leaving it alone: Recover Project File  (the product is blocked on it, and plot exports write nothing)
+a dialog is waiting for a human, leaving it alone: Recover Project File  (nothing else reports it; GET /dialogs lists its buttons)
 ```
 
 设 `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS=1` 会把同一趟巡查变成一只手：

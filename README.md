@@ -134,14 +134,16 @@ anything. A dialog raised before the first engine command is outside
 `utils/modal_guard`'s reach, since that only polls while the bridge is inside
 an engine command, and by definition nothing here is yet. It does **not** hang
 the bridge: a Qt modal runs a nested event loop and the task pump keeps
-ticking inside it (measured — a task still round-trips with the box up). What
-it breaks silently is `plot export bitmap`, which reports success and writes
-nothing at all — indistinguishable from a plot with nothing in it. For an
-agent, whose eyes are bitmap exports, that is the difference between a wrong
-picture and no picture. The log line is the only symptom:
+ticking inside it (measured — a task still round-trips with the box up). Nor
+does it corrupt what the bridge returns: a two-button `QMessageBox` held open
+across a `plot export bitmap` produced a file byte-identical to the one
+exported with no box on screen at all (43359 bytes, same sha256, 197 balls in
+the plot). What is left is silence — nothing fails, so nothing else tells you
+the box is there, and an unanswered box keeps coming back to the front of the
+screen it is on. The log line is the only symptom:
 
 ```text
-a dialog is waiting for a human, leaving it alone: Recover Project File  (the product is blocked on it, and plot exports write nothing)
+a dialog is waiting for a human, leaving it alone: Recover Project File  (nothing else reports it; GET /dialogs lists its buttons)
 ```
 
 Setting `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS=1` turns the same pass

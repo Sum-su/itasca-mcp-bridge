@@ -631,6 +631,8 @@ def test_a_button_the_dialog_does_not_have_is_refused(monkeypatch, tmp_path):
 
     assert result["status"] == "error"
     assert "no 'delete everything' button" in result["message"]
+    # What it does offer, so the caller does not have to ask again to find out.
+    assert "['Open', 'Discard']" in result["message"]
     assert box.buttons[0].clicks == 0
     assert box.buttons[1].clicks == 0
 
@@ -645,7 +647,39 @@ def test_answering_a_dialog_that_is_gone_is_an_error(monkeypatch, tmp_path):
     result, _ = _post_and_drain(1, "Open")
 
     assert result["status"] == "error"
+    assert "not on screen any more" in result["message"]
     assert box.buttons[0].clicks == 0
+
+
+def test_an_id_that_was_never_issued_says_that_instead(monkeypatch, tmp_path):
+    # "not on screen any more" for an id that never existed sends the caller
+    # looking for a dialog that was never there. Both are errors; only one of
+    # them is true, and the message has to be the one that is.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    _with_widgets(monkeypatch, [_dialog("Recover Project File", "Open", "Discard")])
+    autostart.refresh_dialogs()
+
+    result, _ = _post_and_drain(7, "Open")
+
+    assert result["status"] == "error"
+    assert "there is no dialog with id 7" in result["message"]
+    assert "[1]" in result["message"]
+    assert "not on screen" not in result["message"]
+
+
+def test_the_answer_reports_the_label_the_product_draws(monkeypatch, tmp_path):
+    # The caller sends a button name; echoing it back lowercased reads as
+    # though the product had renamed the button under it.
+    monkeypatch.setattr(autostart, "log_path", lambda: str(tmp_path / "autostart.log"))
+    box = _dialog("content probe", "OK", "Cancel")
+    _with_widgets(monkeypatch, [box])
+    autostart.refresh_dialogs()
+
+    result, _ = _post_and_drain(1, "cancel")
+
+    assert result["status"] == "success"
+    assert result["message"] == "answered 'Cancel' on 'content probe'"
+    assert box.buttons[1].clicks == 1
 
 
 def test_a_click_the_product_ignores_is_not_reported_as_an_answer(monkeypatch, tmp_path):

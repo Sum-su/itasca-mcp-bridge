@@ -26,10 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `utils/modal_guard`'s reach, which only polls while the bridge is inside an
   engine command, and by definition nothing here is yet. It does not hang the
   bridge -- a Qt modal runs a nested event loop and the task pump keeps
-  ticking inside it, measured -- but it breaks `plot export bitmap` silently,
-  which reports success and writes nothing at all, and for an agent whose
-  eyes are bitmap exports that is the difference between a wrong picture and
-  no picture. The log line is the only symptom.
+  ticking inside it, measured -- and it does not damage what comes back
+  either: a two-button QMessageBox held open across a `plot export bitmap`
+  produced a file byte-identical to the one exported with no box on screen
+  (43359 bytes, same sha256, 197 balls in the plot). What is left is silence,
+  which is exactly why reporting it matters: nothing fails, so nothing else
+  says the box is there, and an unanswered box keeps coming back to the front
+  of the screen it is on. The log line is the only symptom.
 
   `ITASCA_MCP_BRIDGE_AUTOSTART_DISMISS_WINDOWS=1` opts into acting on that
   watch: it closes the revision notice and answers any dialog whose visible
