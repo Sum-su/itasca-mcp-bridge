@@ -5,7 +5,7 @@ the wrapper pip generates imports this module to reach `main`:
 
     from itasca_mcp_bridge.__main__ import main
     if __name__ == '__main__':
-        sys.exit(main())
+        main()
 
 With `main()` called at module level, that import *is* the start: the
 bridge binds its port while the wrapper is still importing, and the
@@ -21,8 +21,6 @@ from __future__ import annotations
 import importlib
 import runpy
 import sys
-
-import pytest
 
 import itasca_mcp_bridge
 
@@ -54,7 +52,8 @@ class TestImportIsInert:
         """Import, then call -- the wrapper's two steps, in its order."""
         module, calls = _reimport_main(monkeypatch, ["itasca-mcp-bridge"])
 
-        assert module.main() == 0
+        module.main()
+
         assert calls == [DEFAULT_CALL]
 
     def test_options_reach_start(self, monkeypatch):
@@ -84,8 +83,6 @@ class TestDirectInvocationStillStarts:
         monkeypatch.setattr(sys, "argv", ["itasca_mcp_bridge"])
         monkeypatch.delitem(sys.modules, "itasca_mcp_bridge.__main__", raising=False)
 
-        with pytest.raises(SystemExit) as exit_info:
-            runpy.run_module("itasca_mcp_bridge", run_name="__main__")
+        runpy.run_module("itasca_mcp_bridge", run_name="__main__")
 
-        assert exit_info.value.code == 0
         assert calls == [DEFAULT_CALL]

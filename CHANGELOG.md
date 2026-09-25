@@ -7,15 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- `__main__.py` no longer starts the bridge at import time. It called
-  `main()` at module level, and the `itasca-mcp-bridge` console script's
-  entry point is `itasca_mcp_bridge.__main__:main` -- so the wrapper's
-  `from itasca_mcp_bridge.__main__ import main` *was* the start: the bridge
-  bound its port and began serving during that import, PyPI check and all,
-  and the wrapper's own `sys.exit(main())` then called `main()` a second
-  time against a port it already owned. The call is now under an
-  `if __name__ == "__main__"` guard, so importing the module does nothing
-  and the bridge starts exactly once, from either route.
+- Importing `itasca_mcp_bridge.__main__` no longer starts the bridge. The
+  `itasca-mcp-bridge` console script imports that module to reach `main`,
+  so the bare module-level call started the server during the import and
+  the wrapper's own call then hit the port it already owned. The call now
+  sits under an `if __name__ == "__main__"` guard.
 
 ## [0.6.0] - 2026-09-23
 
