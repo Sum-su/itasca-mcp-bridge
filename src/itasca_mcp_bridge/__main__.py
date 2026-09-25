@@ -1,6 +1,16 @@
-"""Allow running as: python -m itasca_mcp_bridge"""
+"""Allow running as: python -m itasca_mcp_bridge
+
+The `main()` call at the bottom sits under an `if __name__` guard, and that
+is load-bearing rather than conventional. The console script's entry point is
+`itasca_mcp_bridge.__main__:main`, so the wrapper pip generates imports this
+module in order to reach `main`. A bare call at module level therefore runs
+during that import -- the bridge binds its port and starts serving while the
+wrapper is still importing -- and the wrapper's own `sys.exit(main())` then
+calls `main()` a second time on top of it, against a port it already owns.
+"""
 
 import argparse
+import sys
 
 from itasca_mcp_bridge import __version__, start
 
@@ -22,6 +32,8 @@ def main():
     args = parser.parse_args()
 
     start(host=args.host, port=args.port, mode=args.mode, auto_upgrade=not args.no_upgrade)
+    return 0
 
 
-main()
+if __name__ == "__main__":
+    sys.exit(main())
